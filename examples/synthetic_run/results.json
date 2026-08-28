@@ -1,0 +1,171 @@
+{
+  "run": "20260828-112549_synthetic",
+  "fs": 256,
+  "line_hz": 50,
+  "epochs_kept": 224,
+  "epochs_rejected": 0,
+  "band_power_abs": {
+    "eyes_closed": {
+      "TP9": {
+        "delta": 30.0898,
+        "theta": 23.2174,
+        "alpha": 376.7598,
+        "beta": 32.6286,
+        "gamma": 11.4562
+      },
+      "AF7": {
+        "delta": 36.2025,
+        "theta": 24.7712,
+        "alpha": 80.4298,
+        "beta": 37.4124,
+        "gamma": 14.3465
+      },
+      "AF8": {
+        "delta": 29.9185,
+        "theta": 22.6736,
+        "alpha": 82.3549,
+        "beta": 32.9595,
+        "gamma": 12.2273
+      },
+      "TP10": {
+        "delta": 39.3322,
+        "theta": 27.4195,
+        "alpha": 394.3265,
+        "beta": 41.0528,
+        "gamma": 15.0162
+      }
+    },
+    "eyes_open": {
+      "TP9": {
+        "delta": 29.016,
+        "theta": 23.1987,
+        "alpha": 34.3568,
+        "beta": 33.2839,
+        "gamma": 12.0913
+      },
+      "AF7": {
+        "delta": 247.6239,
+        "theta": 27.733,
+        "alpha": 37.6651,
+        "beta": 38.6889,
+        "gamma": 13.7397
+      },
+      "AF8": {
+        "delta": 245.9799,
+        "theta": 23.8533,
+        "alpha": 37.3742,
+        "beta": 34.009,
+        "gamma": 12.8515
+      },
+      "TP10": {
+        "delta": 38.1092,
+        "theta": 27.6259,
+        "alpha": 40.8516,
+        "beta": 43.051,
+        "gamma": 14.8355
+      }
+    }
+  },
+  "band_power_rel": {
+    "eyes_closed": {
+      "TP9": {
+        "delta": 0.0602,
+        "theta": 0.0468,
+        "alpha": 0.7598,
+        "beta": 0.0663,
+        "gamma": 0.0233
+      },
+      "AF7": {
+        "delta": 0.1616,
+        "theta": 0.1131,
+        "alpha": 0.3713,
+        "beta": 0.176,
+        "gamma": 0.0678
+      },
+      "AF8": {
+        "delta": 0.1465,
+        "theta": 0.113,
+        "alpha": 0.4045,
+        "beta": 0.1658,
+        "gamma": 0.0615
+      },
+      "TP10": {
+        "delta": 0.0717,
+        "theta": 0.0504,
+        "alpha": 0.7265,
+        "beta": 0.0765,
+        "gamma": 0.0279
+      }
+    },
+    "eyes_open": {
+      "TP9": {
+        "delta": 0.1835,
+        "theta": 0.1493,
+        "alpha": 0.2238,
+        "beta": 0.223,
+        "gamma": 0.0807
+      },
+      "AF7": {
+        "delta": 0.4226,
+        "theta": 0.0992,
+        "alpha": 0.1467,
+        "beta": 0.1554,
+        "gamma": 0.0565
+      },
+      "AF8": {
+        "delta": 0.4208,
+        "theta": 0.0966,
+        "alpha": 0.1617,
+        "beta": 0.1454,
+        "gamma": 0.056
+      },
+      "TP10": {
+        "delta": 0.1932,
+        "theta": 0.1437,
+        "alpha": 0.2149,
+        "beta": 0.2287,
+        "gamma": 0.0796
+      }
+    }
+  },
+  "contrasts": {
+    "TP9": {
+      "alpha_open": 34.3568,
+      "alpha_closed": 376.7598,
+      "ratio_closed_over_open": 10.966,
+      "cohens_d": 10.705,
+      "t": 79.5,
+      "p_value": 1.787893688850476e-110
+    },
+    "AF7": {
+      "alpha_open": 37.6651,
+      "alpha_closed": 80.4298,
+      "ratio_closed_over_open": 2.135,
+      "cohens_d": 2.404,
+      "t": 17.92,
+      "p_value": 2.2239830534172533e-42
+    },
+    "AF8": {
+      "alpha_open": 37.3742,
+      "alpha_closed": 82.3549,
+      "ratio_closed_over_open": 2.204,
+      "cohens_d": 2.526,
+      "t": 18.816,
+      "p_value": 1.2564695381428576e-43
+    },
+    "TP10": {
+      "alpha_open": 40.8516,
+      "alpha_closed": 394.3265,
+      "ratio_closed_over_open": 9.653,
+      "cohens_d": 10.008,
+      "t": 74.323,
+      "p_value": 3.617629843327433e-107
+    }
+  },
+  "heart_rate": {
+    "bpm_mean": 62.0,
+    "bpm_sd": 0.6,
+    "rmssd_ms": 15.5,
+    "n_beats": 248
+  }
+}

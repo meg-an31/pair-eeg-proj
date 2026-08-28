@@ -1,0 +1,7 @@
+# recordings stay out of git - they are large and person-identifiable
+data/*
+!data/README.md
+
+.venv/
+__pycache__/
+*.pyc

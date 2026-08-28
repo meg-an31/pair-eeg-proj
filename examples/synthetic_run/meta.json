@@ -1,0 +1,89 @@
+{
+  "recorded_utc": "2026-08-28T11:25:49.653091+00:00",
+  "board": "SYNTHETIC",
+  "protocol": "eyes",
+  "label": "synthetic",
+  "block_s": 30,
+  "blocks": 4,
+  "duration_s": 240,
+  "line_hz": 50,
+  "ancillary_enabled": true,
+  "eeg": {
+    "fs": 256,
+    "channels": [
+      "TP9",
+      "AF7",
+      "AF8",
+      "TP10"
+    ],
+    "n_samples": 61440,
+    "expected_samples": 61440,
+    "retained_pct": 100.0
+  },
+  "ppg": {
+    "fs": 64,
+    "n_samples": 15360
+  },
+  "imu": {
+    "fs": 52,
+    "n_samples": 12480
+  },
+  "marker_legend": {
+    "1": "eyes_open_start",
+    "2": "eyes_closed_start",
+    "9": "run_end"
+  },
+  "timeline": [
+    {
+      "t_s": 0,
+      "marker": 1,
+      "name": "eyes_open_start"
+    },
+    {
+      "t_s": 30,
+      "marker": 2,
+      "name": "eyes_closed_start"
+    },
+    {
+      "t_s": 60,
+      "marker": 1,
+      "name": "eyes_open_start"
+    },
+    {
+      "t_s": 90,
+      "marker": 2,
+      "name": "eyes_closed_start"
+    },
+    {
+      "t_s": 120,
+      "marker": 1,
+      "name": "eyes_open_start"
+    },
+    {
+      "t_s": 150,
+      "marker": 2,
+      "name": "eyes_closed_start"
+    },
+    {
+      "t_s": 180,
+      "marker": 1,
+      "name": "eyes_open_start"
+    },
+    {
+      "t_s": 210,
+      "marker": 2,
+      "name": "eyes_closed_start"
+    },
+    {
+      "t_s": 240.0,
+      "marker": 9,
+      "name": "run_end"
+    }
+  ],
+  "synthetic_ground_truth": {
+    "alpha_hz": 10.0,
+    "posterior_amplitude_ratio_closed_over_open": "~3.5x at TP9/TP10",
+    "expected_alpha_POWER_ratio": "~10x (power scales as amplitude squared)",
+    "note": "NOT real EEG - for pipeline validation only"
+  }
+}
