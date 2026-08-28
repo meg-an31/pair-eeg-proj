@@ -74,6 +74,31 @@ Filtering → artifact rejection → epoching by condition → Welch PSD → ban
 → eyes-closed vs eyes-open statistics → figures + `results.json` +
 `band_powers.csv`. See `examples/synthetic_run/` for the output shape.
 
+## Heart rate
+
+`analyze.py` reports it automatically when `ppg.csv` has data. The rate is taken
+from the **spectrum** of the cardiac band rather than by counting peaks, because
+peak counting silently under-detects on a noisy trace and then reports a
+confident, wrong number. The channel is chosen by signal quality rather than
+hardcoded, and a trace with no cardiac rhythm above the noise floor reports no
+rate instead of guessing.
+
+When the rate is missing or you do not believe it:
+
+```bash
+python python/ppg_check.py data/<run>
+```
+
+That prints a per-channel quality table and writes `ppg_check.png` — raw
+waveform, band-passed trace with detected beats marked, and the spectrum. One
+clear bump per beat with one mark each means the signal is good; no periodic
+wave at all means sensor contact, not analysis.
+
+HRV (`rmssd_ms`) is only reported when the trace is clean *and* the detected
+beat count matches the rate, and it self-flags when it lands near the 15.6 ms
+floor imposed by the 64 Hz sample rate. Treat the rate as solid and HRV as
+indicative.
+
 ## No headband yet?
 
 ```bash
@@ -95,6 +120,7 @@ before trusting any real recording.
 | `web/index.html` | Self-contained Web Bluetooth EEG client — live scope, quality table, band powers, guided protocol, CSV export. No dependencies. |
 | `python/capture.py` | BrainFlow capture: EEG + PPG + IMU, guided or continuous protocols, signal-quality check. |
 | `python/analyze.py` | Shared analysis pipeline. Consumes either path's output. |
+| `python/ppg_check.py` | PPG diagnostic: per-channel quality table plus a figure of the pulse waveform with detected beats. Run it when the heart rate is missing or implausible. |
 | `python/synth.py` | Synthetic known-truth generator for validating the pipeline. |
 | `examples/synthetic_run/` | Reference output of `analyze.py` on synthetic data. |
 | `docs/SETUP.md` | Step-by-step install, and the problems we actually hit. |

@@ -75,6 +75,11 @@ EEG and IMU look fine. `capture.py` now tries the model's codes in order and
 checks that ancillary samples actually arrive before trusting the result;
 `--ppg-preset p51` forces a specific one.
 
+If PPG streams but the rate looks wrong — a large `bpm_sd`, an implausible
+RMSSD, or far fewer beats than the rate implies — run
+`python python/ppg_check.py data/<run>` and look at `ppg_check.png`. A clear
+periodic wave means the detector; no wave means contact.
+
 The other requirement is physical: the pulse sensor is in the **centre of the
 forehead band** and needs firmer, flatter contact than the EEG electrodes do.
 Sit still — PPG is much more motion-sensitive than EEG.

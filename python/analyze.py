@@ -124,29 +124,118 @@ def cohens_d(a, b):
 
 
 # ----------------------------------------------------------------- ppg -------
+PPG_BAND = (0.7, 3.5)          # 42-210 bpm
+PPG_SNR_MIN = 8.0              # below this the cardiac band is indistinguishable
+PPG_SNR_HRV = 50.0             # HRV needs a much cleaner trace than a rate does
+
+
+def ppg_pulsatile(x, fs):
+    """Dominant frequency in the cardiac band, and how far it stands above that
+    band's own background. Returns (hz, snr) or None.
+
+    Frequency-domain because it does not care about peak shape: a rate estimate
+    survives baseline drift, motion bursts and a half-detached sensor, all of
+    which wreck peak counting.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 20 * fs:
+        return None
+    nper = int(min(x.size, 32 * fs))            # >=32 s -> ~1.9 bpm resolution
+    f, pxx = signal.welch(signal.detrend(x), fs=fs, nperseg=nper)
+    band = (f >= PPG_BAND[0]) & (f <= PPG_BAND[1])
+    if band.sum() < 3:
+        return None
+    fb, pb = f[band], pxx[band]
+    k = int(np.argmax(pb))
+    hz = float(fb[k])
+    # parabolic interpolation on the log spectrum for sub-bin accuracy
+    if 0 < k < len(pb) - 1:
+        a, b, c = np.log(pb[k-1] + 1e-30), np.log(pb[k] + 1e-30), np.log(pb[k+1] + 1e-30)
+        denom = a - 2*b + c
+        if denom != 0:
+            hz = float(fb[k] + 0.5 * (a - c) / denom * (fb[1] - fb[0]))
+    med = float(np.median(pb))
+    return hz, (float(pb[k]) / med if med > 0 else 0.0)
+
+
+def ppg_channels(data):
+    return [n for n in data.dtype.names if n.upper().startswith("PPG")]
+
+
 def heart_rate(run_dir, meta):
+    """Heart rate from PPG, with the channel chosen by signal quality.
+
+    The rate comes from the spectrum; peak detection is used only for HRV and
+    only when the trace is clean enough to justify it. An earlier version read a
+    hardcoded channel and counted peaks with a std-based prominence, which on a
+    poor trace silently found a fraction of the beats and reported a confident
+    but meaningless number.
+    """
     path = Path(run_dir) / "ppg.csv"
     if not path.exists() or meta.get("ppg", {}).get("n_samples", 0) < 100:
         return None
     d = np.genfromtxt(path, delimiter=",", names=True)
     fs = meta["ppg"]["fs"]
-    # PPG1 (IR) is usually the cleanest pulsatile channel
-    x = d["PPG1"] if "PPG1" in d.dtype.names else d[d.dtype.names[1]]
-    sos = signal.butter(3, [0.7, 3.5], btype="bandpass", fs=fs, output="sos")
-    x = signal.sosfiltfilt(sos, signal.detrend(x))
-    peaks, _ = signal.find_peaks(x, distance=int(0.4 * fs), prominence=np.std(x) * 0.5)
-    if len(peaks) < 5:
+
+    scored = []
+    for name in ppg_channels(d):
+        r = ppg_pulsatile(d[name], fs)
+        if r:
+            scored.append((r[1], r[0], name))
+    if not scored:
         return None
+    snr, hz, chan = max(scored)
+    bpm = 60.0 * hz
+
+    out = {"bpm_mean": round(bpm, 1), "channel": chan, "snr": round(snr, 1),
+           "fs": fs, "quality": "ok"}
+
+    if snr < PPG_SNR_MIN:
+        out.update(quality="unusable", bpm_mean=None,
+                   note="no cardiac rhythm above the noise floor on any channel")
+        return out
+
+    # --- beat detection, for HRV and as a cross-check on the spectral rate ----
+    x = np.asarray(d[chan], dtype=float)
+    x = x[np.isfinite(x)]
+    sos = signal.butter(3, PPG_BAND, btype="bandpass", fs=fs, output="sos")
+    xf = signal.sosfiltfilt(sos, signal.detrend(x))
+    mad = float(np.median(np.abs(xf - np.median(xf))))
+    prom = max(1.4826 * mad * 0.6, 1e-9)        # robust to artifact spikes
+    peaks, _ = signal.find_peaks(xf, distance=int(0.5 * (60.0 / bpm) * fs),
+                                 prominence=prom)
+    secs = x.size / fs
+    expected = secs * bpm / 60.0
+    out["n_beats"] = int(len(peaks))
+    out["expected_beats"] = int(round(expected))
+    out["beat_coverage"] = round(len(peaks) / expected, 2) if expected else None
+
     ibi = np.diff(peaks) / fs
-    ibi = ibi[(ibi > 0.35) & (ibi < 1.8)]
-    if len(ibi) < 4:
-        return None
-    return {
-        "bpm_mean": round(float(60 / np.mean(ibi)), 1),
-        "bpm_sd": round(float(np.std(60 / ibi)), 1),
-        "rmssd_ms": round(float(np.sqrt(np.mean(np.diff(ibi) ** 2)) * 1000), 1),
-        "n_beats": int(len(peaks)),
-    }
+    if ibi.size:
+        centre = 60.0 / bpm
+        ibi = ibi[(ibi > 0.5 * centre) & (ibi < 1.6 * centre)]
+    if ibi.size >= 4:
+        out["bpm_peaks"] = round(float(60.0 / np.mean(ibi)), 1)
+        out["bpm_sd"] = round(float(np.std(60.0 / ibi)), 1)
+
+    good_coverage = out["beat_coverage"] is not None and 0.85 <= out["beat_coverage"] <= 1.15
+    if ibi.size >= 5 and snr >= PPG_SNR_HRV and good_coverage:
+        out["rmssd_ms"] = round(float(np.sqrt(np.mean(np.diff(ibi) ** 2)) * 1000), 1)
+        floor_ms = 1000.0 / fs
+        if out["rmssd_ms"] < 2 * floor_ms:
+            out["rmssd_note"] = (f"at the {floor_ms:.1f} ms sampling floor - "
+                                 "treat as no resolvable variability")
+    else:
+        out["rmssd_ms"] = None
+        out["rmssd_note"] = "not reported: trace too noisy or beats under-detected"
+
+    if not good_coverage:
+        out["quality"] = "rate only"
+        out["note"] = (f"found {out['n_beats']} beats where the rate implies "
+                       f"{out['expected_beats']}; rate is from the spectrum and "
+                       "still trustworthy, per-beat timing is not")
+    return out
 
 
 # ---------------------------------------------------------------- plots ------
@@ -299,8 +388,24 @@ def main():
     hr = heart_rate(run_dir, meta)
     if hr:
         results["heart_rate"] = hr
-        print(f"\n  PPG: {hr['bpm_mean']} +/- {hr['bpm_sd']} bpm, "
-              f"RMSSD {hr['rmssd_ms']} ms over {hr['n_beats']} beats")
+        if hr["quality"] == "unusable":
+            print(f"\n  PPG: no heart rate - {hr['note']}")
+            print(f"       best channel {hr['channel']}, SNR {hr['snr']} "
+                  f"(need >= {PPG_SNR_MIN:.0f}). Reseat the band flat on the")
+            print("       centre of the forehead and sit still.")
+        else:
+            print(f"\n  PPG: {hr['bpm_mean']} bpm  "
+                  f"[channel {hr['channel']}, SNR {hr['snr']}]")
+            print(f"       beats detected {hr['n_beats']} of "
+                  f"{hr['expected_beats']} expected "
+                  f"(coverage {hr['beat_coverage']})")
+            if hr.get("rmssd_ms") is not None:
+                print(f"       HRV RMSSD {hr['rmssd_ms']} ms"
+                      + (f" - {hr['rmssd_note']}" if hr.get("rmssd_note") else ""))
+            else:
+                print(f"       HRV {hr.get('rmssd_note','')}")
+            if hr["quality"] == "rate only":
+                print(f"       NOTE: {hr['note']}")
 
     (run_dir / "results.json").write_text(json.dumps(results, indent=2))
 

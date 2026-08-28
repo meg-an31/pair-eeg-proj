@@ -245,7 +245,13 @@ def main():
     countdown(5, "starting in ")
 
     # ---- recording ---------------------------------------------------------
-    board.get_board_data()  # fresh start
+    # Drain every preset, not just EEG: the quality check above only consumed
+    # the EEG buffer, so PPG and IMU would otherwise carry that period into the
+    # recording and start ahead of eeg.csv.
+    for _p in (BrainFlowPresets.DEFAULT_PRESET,
+               BrainFlowPresets.ANCILLARY_PRESET,
+               BrainFlowPresets.AUXILIARY_PRESET):
+        fetch(board, _p)
     t0 = time.time()
     timeline = []
 
