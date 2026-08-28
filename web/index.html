@@ -83,7 +83,7 @@
 
   <div class="card">
     <h2>Live EEG — 5&nbsp;s window</h2>
-    <canvas id="scope" height="380"></canvas>
+    <canvas id="scope" height="460"></canvas>
     <div class="legend">
       <span><i style="background:var(--c0)"></i>TP9 left ear</span>
       <span><i style="background:var(--c1)"></i>AF7 left forehead</span>
@@ -1003,11 +1003,16 @@ function drawScope(){
   g.clearRect(0,0,w,h);
   const lane = h / 4;
   for (let c = 0; c < 4; c++){
-    const y0 = lane * c + lane/2;
+    const top = lane * c, y0 = top + lane/2;
+    // lane separators, so each channel owns a visible strip
+    if (c > 0){
+      g.strokeStyle = "#232b38"; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(0, top); g.lineTo(w, top); g.stroke();
+    }
     g.strokeStyle = "#1c2230"; g.lineWidth = 1;
     g.beginPath(); g.moveTo(0,y0); g.lineTo(w,y0); g.stroke();
-    g.fillStyle = "#6e7681"; g.font = "11px ui-monospace,monospace";
-    g.fillText(CH[c], 6, y0 - lane/2 + 14);
+    g.fillStyle = COLORS[c]; g.font = "11px ui-monospace,monospace";
+    g.fillText(CH[c], 6, top + 14);
 
     if (ringFilled < 2) continue;
     // autoscale per lane, clamped so a flat channel is not amplified to noise
@@ -1018,17 +1023,25 @@ function drawScope(){
     }
     peak = Math.min(Math.max(peak, 20), 500);
     const sy = (lane * 0.42) / peak;
+    /* Clamp every drawn sample to its own lane. Without this, an artifact
+       larger than the ±500 µV scale cap shot the trace across neighbouring
+       lanes - and the bottom lane's excursions left the canvas entirely, which
+       made TP10 (right ear) invisible on a noisy recording. */
+    const yMin = top + 4, yMax = top + lane - 4;
+    g.save();
+    g.beginPath(); g.rect(0, top, w, lane); g.clip();
     g.strokeStyle = COLORS[c]; g.lineWidth = 1.1;
     g.beginPath();
     for (let i = 0; i < ringFilled; i++){
       const p = (ringPos - ringFilled + i + RING) % RING;
       const x = w * i / RING;
-      const y = y0 - ring[c][p] * sy;
+      const y = Math.max(yMin, Math.min(yMax, y0 - ring[c][p] * sy));
       i ? g.lineTo(x,y) : g.moveTo(x,y);
     }
     g.stroke();
+    g.restore();
     g.fillStyle = "#484f58";
-    g.fillText("±" + Math.round(peak) + " µV", w - 62, y0 - lane/2 + 14);
+    g.fillText("±" + Math.round(peak) + " µV", w - 62, top + 14);
   }
 }
 
