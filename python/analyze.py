@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from scipy import signal, stats
+from scipy import ndimage, signal, stats
 
 import matplotlib
 matplotlib.use("Agg")           # headless-safe; must precede pyplot import
@@ -129,34 +129,67 @@ PPG_SNR_MIN = 8.0              # below this the cardiac band is indistinguishabl
 PPG_SNR_HRV = 50.0             # HRV needs a much cleaner trace than a rate does
 
 
-def ppg_pulsatile(x, fs):
-    """Dominant frequency in the cardiac band, and how far it stands above that
-    band's own background. Returns (hz, snr) or None.
+def _whiten(pxx, df, halfwidth_hz=0.5):
+    """Divide the spectrum by its own local median.
 
-    Frequency-domain because it does not care about peak shape: a rate estimate
-    survives baseline drift, motion bursts and a half-detached sensor, all of
-    which wreck peak counting.
+    PPG baseline wander is broadband and 1/f-shaped, so inside a band that
+    starts at 0.7 Hz the raw maximum sits at the low edge whatever the pulse is
+    doing - which reported ~47 bpm for a true 78. Whitening scores how far each
+    bin stands above its neighbourhood instead of its absolute height, so a
+    narrow cardiac peak beats a broad slope.
+    """
+    w = max(3, int(round(halfwidth_hz / df)) | 1)
+    base = ndimage.median_filter(pxx, size=w, mode="nearest")
+    return pxx / np.maximum(base, 1e-30)
+
+
+def ppg_pulsatile(x, fs, harmonics=3):
+    """Heart rate as the frequency whose harmonic series best explains the
+    spectrum. Returns (hz, score) or None.
+
+    Picking the single largest bin in the cardiac band is not enough: baseline
+    wander wins that contest. A genuine pulse also puts energy at 2f and 3f,
+    while a drift shoulder does not, so candidates are scored across their
+    harmonics.
     """
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if x.size < 20 * fs:
         return None
-    nper = int(min(x.size, 32 * fs))            # >=32 s -> ~1.9 bpm resolution
+    nper = int(min(x.size, 32 * fs))
     f, pxx = signal.welch(signal.detrend(x), fs=fs, nperseg=nper)
-    band = (f >= PPG_BAND[0]) & (f <= PPG_BAND[1])
-    if band.sum() < 3:
+    if f.size < 8:
         return None
-    fb, pb = f[band], pxx[band]
-    k = int(np.argmax(pb))
-    hz = float(fb[k])
-    # parabolic interpolation on the log spectrum for sub-bin accuracy
-    if 0 < k < len(pb) - 1:
-        a, b, c = np.log(pb[k-1] + 1e-30), np.log(pb[k] + 1e-30), np.log(pb[k+1] + 1e-30)
-        denom = a - 2*b + c
-        if denom != 0:
-            hz = float(fb[k] + 0.5 * (a - c) / denom * (fb[1] - fb[0]))
-    med = float(np.median(pb))
-    return hz, (float(pb[k]) / med if med > 0 else 0.0)
+    df = float(f[1] - f[0])
+    wht = _whiten(pxx, df)
+
+    k_lo = max(1, int(np.ceil(PPG_BAND[0] / df)))
+    k_hi = int(np.floor(PPG_BAND[1] / df))
+    if k_hi <= k_lo:
+        return None
+
+    best_k, best_score = None, -np.inf
+    for k in range(k_lo, k_hi + 1):
+        score, used = 0.0, 0
+        for h in range(1, harmonics + 1):
+            kh = k * h
+            if kh >= wht.size:
+                break
+            score += np.log(wht[kh] + 1e-30)
+            used += 1
+        score /= used                      # mean, so fewer harmonics is not punished
+        if score > best_score:
+            best_score, best_k = score, k
+
+    k = best_k
+    hz = k * df
+    if 0 < k < wht.size - 1:               # parabolic refinement on the whitened peak
+        a, b, c = (np.log(wht[k-1] + 1e-30), np.log(wht[k] + 1e-30),
+                   np.log(wht[k+1] + 1e-30))
+        den = a - 2*b + c
+        if den != 0:
+            hz += 0.5 * (a - c) / den * df
+    return float(hz), float(wht[k])
 
 
 def ppg_channels(data):

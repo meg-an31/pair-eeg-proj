@@ -75,6 +75,16 @@ EEG and IMU look fine. `capture.py` now tries the model's codes in order and
 checks that ancillary samples actually arrive before trusting the result;
 `--ppg-preset p51` forces a specific one.
 
+**A rate around 45-50 bpm is the classic drift artefact.** The cardiac band
+starts at 0.7 Hz = 42 bpm, and baseline wander is 1/f-shaped, so the largest raw
+bin in that band sits at the low edge whatever your pulse is doing. Both the
+Python analysis and the web page now whiten the spectrum against its local
+median and score candidates across their harmonics (a real pulse puts energy at
+2f and 3f; a drift shoulder does not), which recovers the true rate from a trace
+where the naive method read 47 bpm for a true 78. If you are on an older copy,
+update. And check it against your wrist: a fit person at rest genuinely can sit
+at 50.
+
 If PPG streams but the rate looks wrong — a large `bpm_sd`, an implausible
 RMSSD, or far fewer beats than the rate implies — run
 `python python/ppg_check.py data/<run>` and look at `ppg_check.png`. A clear

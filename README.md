@@ -80,10 +80,13 @@ Filtering → artifact rejection → epoching by condition → Welch PSD → ban
 
 ## Heart rate
 
-`analyze.py` reports it automatically when `ppg.csv` has data. The rate is taken
-from the **spectrum** of the cardiac band rather than by counting peaks, because
-peak counting silently under-detects on a noisy trace and then reports a
-confident, wrong number. The channel is chosen by signal quality rather than
+`analyze.py` reports it automatically when `ppg.csv` has data, and the browser
+page shows it live. The rate is taken from the **spectrum** of the cardiac band
+rather than by counting peaks, because peak counting silently under-detects on a
+noisy trace and then reports a confident, wrong number. The spectrum is whitened
+against its local median and candidates are scored across their harmonic series,
+because baseline wander is 1/f-shaped and otherwise wins the contest for largest
+bin - which reads as a spuriously low rate near the band's 42 bpm floor. The channel is chosen by signal quality rather than
 hardcoded, and a trace with no cardiac rhythm above the noise floor reports no
 rate instead of guessing.
 
