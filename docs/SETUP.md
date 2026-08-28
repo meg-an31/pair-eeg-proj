@@ -66,6 +66,19 @@ TP10 (right ear). Aim for RMS roughly 5–45 µV per channel.
 | Browser: page loads but cannot connect | insecure context | serve over `http://localhost` or `https://`, not `file://` |
 | One flat channel | sensor contact | see above |
 
+## PPG / heart rate
+
+The preset code that enables PPG differs by model: **`p50`/`p51` on Muse 2**,
+**`p61`/`p50` on Muse S**. A Muse 2 *accepts* the Muse S code `p61` without any
+error and then streams no PPG at all — `ppg.csv` comes out with 0 samples while
+EEG and IMU look fine. `capture.py` now tries the model's codes in order and
+checks that ancillary samples actually arrive before trusting the result;
+`--ppg-preset p51` forces a specific one.
+
+The other requirement is physical: the pulse sensor is in the **centre of the
+forehead band** and needs firmer, flatter contact than the EEG electrodes do.
+Sit still — PPG is much more motion-sensitive than EEG.
+
 ## A note on cloud machines
 
 A cloud VM has no Bluetooth radio — no adapter, no BlueZ, no `bluetooth.service`.

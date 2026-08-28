@@ -41,6 +41,17 @@ BOARDS = {
     "muse2016": BoardIds.MUSE_2016_BOARD,
 }
 
+# Preset codes that turn the ancillary (PPG) stream on. These are firmware
+# codes and they differ between models: p61 is a Muse S code, and a Muse 2
+# ACCEPTS it silently while streaming no PPG at all - which is why enable_ppg()
+# below verifies that samples actually arrive instead of trusting config_board().
+PPG_PRESETS = {
+    "muse2":      ["p50", "p51"],
+    "muse2_bled": ["p50", "p51"],
+    "muse_s":     ["p61", "p50"],
+    "muse2016":   [],                # no PPG sensor on the 2016 model
+}
+
 # Marker codes written into the EEG stream.
 MARKERS = {1: "eyes_open_start", 2: "eyes_closed_start", 9: "run_end"}
 
@@ -102,6 +113,34 @@ def fetch(board, preset):
         return np.empty((0, 0))
 
 
+def enable_ppg(board, codes):
+    """Turn on the PPG stream, confirming by data rather than by return code.
+
+    config_board() succeeding proves nothing: a Muse 2 accepts the Muse S
+    preset 'p61' without error and then streams no PPG. So each candidate code
+    is tried, the stream started, and the ancillary buffer checked for real
+    samples. Leaves the stream running on return either way, so EEG still
+    records even when no code yields PPG.
+    """
+    for code in codes:
+        try:
+            board.config_board(code)
+        except BrainFlowError as exc:
+            print(f"  preset {code}: rejected ({exc})")
+            continue
+        board.start_stream(450000)
+        time.sleep(3)
+        if fetch(board, BrainFlowPresets.ANCILLARY_PRESET).size:
+            print(f"  preset {code}: PPG streaming")
+            return code, True
+        board.stop_stream()
+        print(f"  preset {code}: accepted but no PPG data - trying next")
+    board.start_stream(450000)
+    if codes:
+        print("  no preset produced PPG; recording EEG + IMU only")
+    return None, False
+
+
 def save_stream(path, data, ch_rows, ch_names, ts_row, t0, extra_rows=None):
     """Write one preset's buffer to CSV with a relative-time column."""
     if data.size == 0:
@@ -135,6 +174,9 @@ def main():
     ap.add_argument("--label", default="run")
     ap.add_argument("--outdir", default="data")
     ap.add_argument("--timeout", type=int, default=25, help="BLE discovery seconds")
+    ap.add_argument("--ppg-preset", default="", metavar="CODE",
+                    help="force a PPG preset code (p50/p51/p61) instead of "
+                         "auto-detecting; see PPG_PRESETS")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -168,19 +210,20 @@ def main():
         )
         sys.exit(1)
 
-    # Ask the headband for PPG + IMU in addition to EEG. Preset codes vary by
-    # firmware; failure here is non-fatal, EEG still streams.
-    ancillary_ok = True
-    try:
-        board.config_board("p61")
-    except BrainFlowError as exc:
-        ancillary_ok = False
-        print(f"  note: PPG/IMU preset rejected ({exc}); continuing with EEG only.")
+    # Ask the headband for PPG in addition to EEG/IMU.
+    codes = [args.ppg_preset] if args.ppg_preset else PPG_PRESETS[args.board]
+    print("Enabling ancillary streams...")
+    ppg_code, ancillary_ok = enable_ppg(board, codes)
 
-    board.start_stream(450000)
     print("Streaming. Warming up...")
     time.sleep(3)
-    board.get_board_data()  # discard warm-up buffer
+    # Drain the pre-roll from EVERY preset. get_board_data() with no preset
+    # clears only the EEG buffer, which left ppg.csv and imu.csv starting
+    # seconds before eeg.csv and the three streams out of alignment.
+    for _p in (BrainFlowPresets.DEFAULT_PRESET,
+               BrainFlowPresets.ANCILLARY_PRESET,
+               BrainFlowPresets.AUXILIARY_PRESET):
+        fetch(board, _p)
 
     # ---- quality check -----------------------------------------------------
     print(f"Signal-quality check ({args.check_secs:.0f}s) - sit still, relax your jaw.")
@@ -275,6 +318,7 @@ def main():
         "duration_s": round(elapsed, 2),
         "line_hz": args.line_hz,
         "ancillary_enabled": ancillary_ok,
+        "ppg_preset": ppg_code,
         "eeg": {"fs": fs_eeg, "channels": eeg_names, "n_samples": n_eeg,
                 "expected_samples": expected, "retained_pct": round(kept, 1)},
         "ppg": {"fs": BoardShim.get_sampling_rate(board_id, BrainFlowPresets.ANCILLARY_PRESET),
@@ -290,6 +334,11 @@ def main():
     print(f"  eeg.csv  {n_eeg:7d} samples   retained {kept:.1f}% of expected")
     print(f"  ppg.csv  {n_ppg:7d} samples")
     print(f"  imu.csv  {n_imu:7d} samples")
+    if n_ppg == 0:
+        print("\n  NOTE: no PPG samples, so analyze.py will report no heart rate.")
+        print("  Try --ppg-preset p51 (or p50), and make sure the band sits snug")
+        print("  and flat on the centre of the forehead - that is where the pulse")
+        print("  sensor is. PPG needs firmer contact than EEG does.")
     if kept < 90:
         print("\n  WARNING: heavy packet loss. Move closer to the headband, reduce")
         print("  Bluetooth/Wi-Fi contention, or use a BLED112 dongle.")
