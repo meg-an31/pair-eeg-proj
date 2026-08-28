@@ -185,6 +185,16 @@ def ppg_pulsatile(x, fs, harmonics=3):
     best_score = float(np.max(scores[k_lo:k_hi + 1]))
     near = np.flatnonzero(scores[k_lo:k_hi + 1] >= best_score - 0.15) + k_lo
     k = int(near[0])
+
+    # Octave guard: if half this frequency also carries a real whitened peak,
+    # the candidate is the 2nd harmonic of a slower pulse - take the
+    # fundamental. A genuinely fast pulse has only noise (wht ~ 1) at half its
+    # rate, so this does not clamp true high rates.
+    k2 = int(round(k / 2))
+    if k2 - 1 >= k_lo:
+        j = k2 - 1 + int(np.argmax(wht[k2 - 1:k2 + 2]))
+        if wht[j] >= 3.0:
+            k = j
     hz = k * df
     if 0 < k < wht.size - 1:               # parabolic refinement on the whitened peak
         a, b, c = (np.log(wht[k-1] + 1e-30), np.log(wht[k] + 1e-30),

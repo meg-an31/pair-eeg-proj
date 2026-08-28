@@ -174,7 +174,7 @@ const epoch = CH.map(() => 0);          // uint16 unwrap counter
 const last  = CH.map(() => -1);
 
 let device = null, chars = [], demoTimer = null, packets = 0, packetT0 = 0;
-let demoBpm = 66.0, demoDrift = false, demoArtifact = 0;  // test hooks, see bottom
+let demoBpm = 66.0, demoDrift = false, demoArtifact = 0, demoHarm2 = false;
 let rec = null;                         // {rows, t0, markers, protocol, ...}
 let guided = null;                      // guided-protocol timer state
 
@@ -441,8 +441,18 @@ function startDemo(){
           if (demoArtifact && ch === 2)
             art = 1400 * Math.sin(2*Math.PI*demoArtifact*t)
                 + 500 * Math.sin(4*Math.PI*demoArtifact*t + 0.4);
-          vals.push(120000 + amp * (Math.sin(2*Math.PI*hz*t)
-                    + 0.35 * Math.sin(4*Math.PI*hz*t + 0.9))
+          let wave;
+          if (demoHarm2){
+            /* weak fundamental that VANISHES for ~20 s of every 40 s, the way
+               forehead perfusion comes and goes - the 2nd harmonic keeps going */
+            const fund = (Math.sin(2*Math.PI*t/40) > 0 ? 0.45 : 0.0);
+            wave = fund * Math.sin(2*Math.PI*hz*t)
+                 + 1.0 * Math.sin(4*Math.PI*hz*t + 0.7)
+                 + 0.25 * Math.sin(6*Math.PI*hz*t);
+          } else {
+            wave = Math.sin(2*Math.PI*hz*t) + 0.35 * Math.sin(4*Math.PI*hz*t + 0.9);
+          }
+          vals.push(120000 + amp * wave
                     + wander + art + (Math.random()-0.5) * amp * 0.35);
         }
         pushPpg(ch, pk, vals);
@@ -466,7 +476,7 @@ function teardown(msg){
 function reset(){
   rows.clear(); nextRow = -1; maxSeen = -1; gaps = 0;
   held.fill(0); ringPos = 0; ringFilled = 0;
-  hrHist = [];
+  hrHist = []; hrTrackBpm = null;
   pRows.clear(); pNext = -1; pMax = -1; pGaps = 0;
   pHeld.fill(0); pPos = 0; pFilled = 0;
   for (let c = 0; c < 3; c++){ pring[c].fill(0); pAbs[c] = -1; pEpoch[c] = 0; pLast[c] = -1; }
@@ -691,7 +701,7 @@ function whiten(psd, df, upto){
 
 /* A real pulse also puts energy at 2f and 3f; a drift shoulder does not. So
    candidates are scored across their harmonic series rather than by height. */
-function channelRate(ch, N, df, kLo, kHi){
+function channelRate(ch, N, df, kLo, kHi, track){
   const psd = ppgSpectrum(ch, N);
   if (!psd) return null;
   const HARM = 3;
@@ -706,6 +716,11 @@ function channelRate(ch, N, df, kLo, kHi){
       sc += Math.log(wht[kh] + 1e-30); used++;
     }
     score[k] = sc / used;
+    /* Continuity: a resting heart rate does not teleport. Candidates near the
+       currently tracked rate get a bonus worth ~1.6x in power, so a frame
+       where the 2nd harmonic momentarily outscores the fundamental does not
+       flip the readout; a genuine sustained change still overcomes it. */
+    if (track && Math.abs(60*k*df - track) / track < 0.12) score[k] += 0.5;
     if (score[k] > bs) bs = score[k];
   }
   /* Among candidates that score within a whisker of the best, take the LOWEST
@@ -714,6 +729,15 @@ function channelRate(ch, N, df, kLo, kHi){
   let bk = kLo;
   for (let k = kLo; k <= kHi; k++){
     if (score[k] >= bs - 0.15){ bk = k; break; }
+  }
+  /* Octave guard: if half this frequency also carries a real whitened peak,
+     the candidate is the 2nd harmonic of a slower pulse - take the fundamental.
+     A genuinely fast pulse has only noise (wht ~ 1) at half its rate. */
+  const k2 = Math.round(bk / 2);
+  if (k2 - 1 >= kLo){
+    let j = k2 - 1;
+    for (let i = k2; i <= k2 + 1; i++) if (wht[i] > wht[j]) j = i;
+    if (wht[j] >= 3) bk = j;
   }
   let hz = bk * df;
   if (bk > 0 && bk < wht.length - 1){
@@ -733,7 +757,7 @@ function channelRate(ch, N, df, kLo, kHi){
    backed by the most channels wins, and the displayed value is the median of
    the last few seconds rather than the latest frame. */
 const HR_HIST = 12;                     // 12 x 250 ms = 3 s
-let hrHist = [];
+let hrHist = [], hrTrackBpm = null;
 
 function heartRate(){
   const N = ppgWindow();
@@ -745,7 +769,7 @@ function heartRate(){
 
   const per = [];
   for (let ch = 0; ch < 3; ch++){
-    const r = channelRate(ch, N, df, kLo, kHi);
+    const r = channelRate(ch, N, df, kLo, kHi, hrTrackBpm);
     if (r) per.push(r);
   }
   if (!per.length) return null;
@@ -771,6 +795,7 @@ function heartRate(){
   const spread = hrHist.length >= 4
     ? (sorted[sorted.length-1] - sorted[0]) / med : 0;
 
+  hrTrackBpm = spread > 0.15 ? null : med;   // drop the lock when unstable
   return { bpm: med, snr: best.snr, ch: best.ch, agree: best.agree,
            secs: N / PFS, spread, n: hrHist.length };
 }
@@ -973,8 +998,12 @@ loop();
   const q = new URLSearchParams(location.search);
   if (!q.has("demo")) return;
   if (q.has("bpm")) demoBpm = parseFloat(q.get("bpm")) || 66.0;
+  window.hrSeries = [];
+  setInterval(() => { const h = heartRate();
+    if (h && h.n >= 4) window.hrSeries.push(+h.bpm.toFixed(1)); }, 1000);
   demoDrift = q.has("drift");
   demoArtifact = q.has("artifact") ? (parseFloat(q.get("artifact")) || 2.83) : 0;
+  demoHarm2 = q.has("harm2");
   startDemo();
   const secs = +q.get("rec") || 0;
   if (!secs) return;
@@ -998,6 +1027,9 @@ loop();
       ppg_first: r ? (ppgCsvOf(r).split("\n")[1] || "") : "",
       ppg_seconds: r && r.prows.length ? +(r.prows.length/PFS).toFixed(2) : 0,
       ppg_t_end: r && r.prows.length ? +r.prows[r.prows.length-1][0].toFixed(2) : null,
+      hr_series: (() => { const a = window.hrSeries || []; if (!a.length) return null;
+        return {n: a.length, min: Math.min.apply(null,a), max: Math.max.apply(null,a),
+                first: a[0], last: a[a.length-1]}; })(),
       hr: (() => { const h = heartRate();
         return h ? {bpm: +h.bpm.toFixed(2), snr: Math.round(h.snr), chan: PCH[h.ch],
                     agree: h.agree, spread: +h.spread.toFixed(3)} : null; })(),

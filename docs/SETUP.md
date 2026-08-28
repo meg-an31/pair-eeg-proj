@@ -85,13 +85,17 @@ where the naive method read 47 bpm for a true 78. If you are on an older copy,
 update. And check it against your wrist: a fit person at rest genuinely can sit
 at 50.
 
-**A rate flipping rapidly between two very different values** (say 65 and 170)
-is not your heart. With a 32 s analysis window, consecutive estimates share
-almost all their data and cannot legitimately jump like that - what flips is
-which of the three PPG channels wins, when one is dominated by a movement
-artifact. The estimate is now the one the most channels agree on, smoothed over
-a 3 s median, and the readout says "unstable" with the spread rather than
-showing a number it cannot stand behind.
+**A rate flipping rapidly between two very different values** (say 80 and 170)
+is not your heart - especially when the high value is about double the low one.
+Two mechanisms cause it, and both are now handled: a movement artifact can
+dominate one PPG channel (the estimate the most channels agree on wins), and
+the pulse's own 2nd harmonic can outweigh its fundamental when forehead
+perfusion fades in and out (an octave guard takes the fundamental whenever half
+the candidate frequency also carries a real peak, and the live page tracks the
+rate over time so one bad window cannot flip the readout). A genuinely fast
+pulse has nothing at half its rate, so real high rates are not clamped. The
+readout says "unstable" with the spread rather than showing a number it cannot
+stand behind.
 
 If PPG streams but the rate looks wrong — a large `bpm_sd`, an implausible
 RMSSD, or far fewer beats than the rate implies — run
