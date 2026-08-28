@@ -17,6 +17,7 @@ must be able to tell "calm" from "not currently measuring".
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -28,10 +29,20 @@ import numpy as np
 from ..config import EEG, IMU, PPG, THERM, Config
 from ..transport.protocol import DataFrame
 from .affect import AffectMapper, AffectValues, NullAffectMapper, Smoother
-from .processing import EpochWindow, ProcessedFeatures, NullProcessor, Processor
+from .processing import (
+    BIN_HZ,
+    N_BINS,
+    EpochWindow,
+    NullProcessor,
+    ProcessedFeatures,
+    Processor,
+)
 from .quality import AcceptRate, QualityGate, QualityVerdict
 from .rawlog import RawLog
 from .ringbuffer import RingBuffer
+
+
+log = logging.getLogger("pair_eeg.session")
 
 
 class SessionState(str, Enum):
@@ -99,9 +110,15 @@ Emit = Callable[[dict], Awaitable[None]]
 class Session:
     """One wearer, one recording, one pipeline instance.
 
+    MAX_TICK_ERRORS bounds how long a broken processor is tolerated before
+    the session gives up; a handful of transient failures should not end a
+    recording, but a persistently raising stage should not be papered over.
+
     Owns the ring buffers, the state machine and the epoch loop. Frames go in
     via `ingest`; results come out via the `emit` callback.
     """
+
+    MAX_TICK_ERRORS = 20
 
     def __init__(
         self,
@@ -144,6 +161,7 @@ class Session:
         self._frames_in = 0
         self._discontinuities = 0
         self._last_ingest: float | None = None
+        self._tick_errors = 0
 
     # ------------------------------------------------------------------ io
 
@@ -179,7 +197,12 @@ class Session:
 
     def begin_baseline(self) -> None:
         """Start the eyes-open rest block. Idempotent."""
-        if self.state in (SessionState.FIT_CHECK, SessionState.LIVE, SessionState.DEGRADED):
+        if self.state in (
+            SessionState.FIT_CHECK,
+            SessionState.LIVE,
+            SessionState.DEGRADED,
+            SessionState.BASELINE,
+        ):
             self.baseline = Baseline()
             self._baseline_started = time.time()
             # Old smoother state was normalised against the previous
@@ -206,6 +229,13 @@ class Session:
         hop_n = int(self.cfg.hop_s * EEG.rate_hz)
         eeg = self.buffers[EEG.name]
 
+        if window_n <= 0:
+            raise ValueError(f"window_s={self.cfg.window_s} is shorter than one sample")
+        if hop_n <= 0:
+            # A zero hop never advances _next_epoch_end and spins forever,
+            # starving the event loop with no way back.
+            raise ValueError(f"hop_s={self.cfg.hop_s} is shorter than one sample")
+
         while True:
             await asyncio.sleep(self.cfg.hop_s)
 
@@ -225,7 +255,20 @@ class Session:
                 if start < eeg.tail:
                     self._next_epoch_end = eeg.head
                     break
-                await self._tick(start, window_n)
+                try:
+                    await self._tick(start, window_n)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Without this the task dies, the socket stays open and
+                    # the front end simply goes quiet with nothing logged.
+                    self._tick_errors += 1
+                    log.exception(
+                        "session %s: epoch tick failed (%d so far)", self.id, self._tick_errors
+                    )
+                    if self._tick_errors >= self.MAX_TICK_ERRORS:
+                        log.error("session %s: too many tick failures, stopping", self.id)
+                        raise
                 self._next_epoch_end += hop_n
 
     async def _check_stalled(self) -> bool:
@@ -287,6 +330,7 @@ class Session:
         )
 
         features = self.processor.process(epoch)
+        features.check_shapes()
 
         if self.state is SessionState.BASELINE:
             self.baseline.observe(features.extras)
@@ -404,7 +448,7 @@ class Session:
     def _spectral(self, features: ProcessedFeatures) -> dict:
         return {
             "channels": list(features.channels),
-            "freqs_hz": {"n": len(features.freqs), "spacing": 1.0},
+            "freqs_hz": {"n": len(features.freqs), "spacing": BIN_HZ},
             "spectrum": features.spectrum.round(4).tolist(),
             "bands": features.bands.round(4).tolist(),
             "band_names": list(features.band_names),
@@ -452,8 +496,8 @@ class Session:
                 "window_s": self.cfg.window_s,
                 "hop_s": self.cfg.hop_s,
                 "baseline_s": self.cfg.baseline_s,
-                "n_bins": 128,
-                "bin_hz": 1.0,
+                "n_bins": N_BINS,
+                "bin_hz": BIN_HZ,
             },
             "stages": {
                 "processing": getattr(self.processor, "name", "unknown"),

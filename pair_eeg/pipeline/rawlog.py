@@ -65,7 +65,10 @@ class RawLog:
             if frame is None:
                 return
             try:
-                self._write(frame)
+                # Off the event loop for real. Doing this inline would block
+                # every session on the slowest disk write, which is exactly
+                # what the queue exists to prevent.
+                await asyncio.to_thread(self._write, frame)
                 self._written += 1
             except Exception:  # a broken log must not take the session down
                 self._dropped += 1

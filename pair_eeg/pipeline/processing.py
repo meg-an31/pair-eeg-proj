@@ -12,10 +12,15 @@ Target shapes, agreed with the front end:
     spectrum : (n_channels, 128) float32   0-127 Hz at 1 Hz spacing
     bands    : (n_channels, 5)   float32   delta theta alpha beta gamma
 
-128 bins at 1 Hz follows from the hardware: the Muse samples at 256 Hz, so
-Nyquist is 128 Hz, and a 256-sample Welch segment gives 1 Hz spacing. Using
-Welch with nperseg=256 across a longer window keeps the 128 bins while
-averaging several segments, which cuts variance without changing resolution.
+Bin spacing follows from the hardware: the Muse samples at 256 Hz and a
+256-sample Welch segment gives 1 Hz spacing. Running Welch with nperseg=256
+across a longer window keeps that spacing while averaging several segments,
+which cuts variance without changing resolution.
+
+Mind the bin count. `scipy.signal.welch(fs=256, nperseg=256)` returns **129**
+bins covering 0-128 Hz inclusive. We ship 128, covering 0-127 Hz — Nyquist
+itself is dropped. The implementation must discard that last bin explicitly;
+`check_shapes` below will catch it if you forget.
 
 Two things the real implementation must get right, both of which the existing
 offline pipeline does not:
@@ -84,13 +89,31 @@ class ProcessedFeatures:
     spectrum: np.ndarray            # (n_channels, N_BINS)
     bands: np.ndarray               # (n_channels, len(BAND_NAMES))
     channels: tuple[str, ...]
-    freqs: np.ndarray = field(default_factory=lambda: FREQS)
+    freqs: np.ndarray = field(default_factory=lambda: FREQS.copy())
     band_names: tuple[str, ...] = BAND_NAMES
     extras: dict[str, float] = field(default_factory=dict)
     implemented: bool = True
 
     def band(self, channel: str, band: str) -> float:
         return float(self.bands[self.channels.index(channel), BAND_NAMES.index(band)])
+
+    def check_shapes(self) -> None:
+        """Fail loudly on a processor that returns the wrong shape.
+
+        The commonest mistake is shipping scipy's natural 129 bins instead of
+        128. Unchecked, that reaches the front end as an off-by-one frequency
+        axis, which looks like a calibration problem rather than a bug.
+        """
+        n_ch = len(self.channels)
+        if self.spectrum.shape != (n_ch, N_BINS):
+            raise ValueError(
+                f"spectrum must be {(n_ch, N_BINS)}, got {self.spectrum.shape}"
+                + (" — drop the Nyquist bin" if self.spectrum.shape[-1] == N_BINS + 1 else "")
+            )
+        if self.bands.shape != (n_ch, len(BAND_NAMES)):
+            raise ValueError(
+                f"bands must be {(n_ch, len(BAND_NAMES))}, got {self.bands.shape}"
+            )
 
 
 @runtime_checkable

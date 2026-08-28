@@ -150,3 +150,61 @@ def test_smoother_returns_axes_the_mapper_did_not_produce():
 def test_affect_values_validates_confidence():
     with pytest.raises(ValueError, match="confidence"):
         AffectValues(axes={"valence": 0.5}, confidence={"valence": 7.0})
+
+
+# --- regressions from the adversarial review -----------------------------
+
+def test_nan_never_reaches_the_wire():
+    """NaN and Infinity are not valid JSON and kill the client's parser."""
+    import json
+    from pair_eeg.transport.protocol import encode_payload
+
+    payload = {
+        "type": "estimate",
+        "spectrum": [[float("nan"), 1.0], [float("inf"), float("-inf")]],
+        "axes": {"valence": float("nan")},
+    }
+    raw = encode_payload(payload)
+    assert "NaN" not in raw and "Infinity" not in raw
+    parsed = json.loads(raw)          # would throw on bare NaN
+    assert parsed["spectrum"][0][0] is None
+    assert parsed["axes"]["valence"] is None
+
+
+def test_wrong_bin_count_is_rejected():
+    """scipy's natural 129 bins must not silently reach the front end."""
+    import numpy as np
+    from pair_eeg.pipeline.processing import BAND_NAMES, N_BINS, ProcessedFeatures
+    from pair_eeg.config import EEG
+
+    good = ProcessedFeatures(
+        spectrum=np.zeros((4, N_BINS), dtype=np.float32),
+        bands=np.zeros((4, len(BAND_NAMES)), dtype=np.float32),
+        channels=EEG.channels,
+    )
+    good.check_shapes()
+
+    off_by_one = ProcessedFeatures(
+        spectrum=np.zeros((4, N_BINS + 1), dtype=np.float32),
+        bands=np.zeros((4, len(BAND_NAMES)), dtype=np.float32),
+        channels=EEG.channels,
+    )
+    with pytest.raises(ValueError, match="Nyquist"):
+        off_by_one.check_shapes()
+
+
+def test_freqs_are_not_shared_between_results():
+    import numpy as np
+    from pair_eeg.pipeline.processing import BAND_NAMES, N_BINS, ProcessedFeatures
+    from pair_eeg.config import EEG
+
+    def make():
+        return ProcessedFeatures(
+            spectrum=np.zeros((4, N_BINS), dtype=np.float32),
+            bands=np.zeros((4, len(BAND_NAMES)), dtype=np.float32),
+            channels=EEG.channels,
+        )
+
+    a, b = make(), make()
+    a.freqs[0] = 999.0
+    assert b.freqs[0] == 0.0

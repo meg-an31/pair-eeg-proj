@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import struct
+from math import isfinite
 from dataclasses import dataclass
 from typing import Any
 
@@ -107,6 +108,24 @@ def encode_message(kind: str, **fields: Any) -> str:
     return json.dumps({"type": kind, **fields}, separators=(",", ":"))
 
 
+def _json_safe(value: Any) -> Any:
+    """Replace NaN and infinity with null, recursively.
+
+    Python's json emits bare `NaN` and `Infinity` tokens, which are not valid
+    JSON — `JSON.parse` throws and the browser loses the entire message, not
+    just the bad field. Band powers reach this point from epochs that legally
+    contain NaN holes, and log of a zero band is -inf, so this is a routine
+    value rather than an exceptional one.
+    """
+    if isinstance(value, float):
+        return value if isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def encode_payload(payload: dict[str, Any]) -> str:
     """Serialise a payload that already carries its own "type".
 
@@ -114,7 +133,7 @@ def encode_payload(payload: dict[str, Any]) -> str:
     """
     if "type" not in payload:
         raise ProtocolError("payload has no 'type'")
-    return json.dumps(payload, separators=(",", ":"))
+    return json.dumps(_json_safe(payload), separators=(",", ":"), allow_nan=False)
 
 
 def decode_message(raw: str) -> dict[str, Any]:

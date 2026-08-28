@@ -119,9 +119,6 @@ class Hub:
             return
 
         session = self.session
-        self.capture_ws = None
-        self.capture_since = None
-        self.session = None
 
         if session is not None:
             await session.stop()
@@ -129,6 +126,14 @@ class Hub:
                 await session.raw_log.close()
             self.store.end_session(session.id)
             log.info("capture released, session %s closed", session.id)
+
+        # Freed only once teardown is complete, so a reconnecting client
+        # cannot claim the slot while the previous session is still closing.
+        self.capture_ws = None
+        self.capture_since = None
+        self.session = None
+
+        if session is not None:
             await self.tell_viewers("session_ended", session=session.id)
 
     # ----------------------------------------------------------- viewers
@@ -151,18 +156,23 @@ class Hub:
         await self._send_all(encode_message(kind, **fields), viewers_only=True)
 
     async def _send_all(self, message: str, viewers_only: bool = False) -> None:
-        targets = set(self.viewers)
+        targets = list(self.viewers)
         if not viewers_only and self.capture_ws is not None:
-            targets.add(self.capture_ws)
+            targets.append(self.capture_ws)
 
-        dead: list[ServerConnection] = []
-        for ws in targets:
-            try:
-                await ws.send(message)
-            except websockets.ConnectionClosed:
-                dead.append(ws)
-        for ws in dead:
-            self.viewers.discard(ws)
+        if not targets:
+            return
+
+        # Concurrently, so one stalled viewer cannot backpressure the epoch
+        # loop and slow the stream for everybody else.
+        results = await asyncio.gather(
+            *(ws.send(message) for ws in targets), return_exceptions=True
+        )
+        for ws, result in zip(targets, results):
+            if isinstance(result, Exception):
+                self.viewers.discard(ws)
+                if ws is self.capture_ws:
+                    log.warning("capture client send failed: %s", result)
 
     def status(self) -> dict:
         """What a client is told on arrival when there is no live session."""

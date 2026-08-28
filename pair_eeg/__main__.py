@@ -29,6 +29,16 @@ def main() -> None:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
+    # A hop or window shorter than one sample makes the epoch loop spin
+    # without advancing. Catch it here rather than at 100% CPU.
+    min_s = 1.0 / 256.0
+    if args.hop < min_s:
+        p.error(f"--hop must be at least {min_s:.5f}s (one sample at 256 Hz)")
+    if args.window < min_s:
+        p.error(f"--window must be at least {min_s:.5f}s")
+    if args.window < args.hop:
+        p.error("--window must be at least as long as --hop")
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
