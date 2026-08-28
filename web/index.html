@@ -52,6 +52,11 @@
             padding:11px 14px;border-radius:8px;font-size:13px}
   .legend{display:flex;gap:14px;font-size:12px;color:var(--dim);margin-top:8px}
   .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
+  .bpm{font-size:46px;font-weight:700;text-align:center;padding:6px 0 2px;
+       font-variant-numeric:tabular-nums;line-height:1.1}
+  .bpm small{display:block;font-size:13px;font-weight:400;color:var(--dim)}
+  .bpm.bad{color:var(--dim)}
+  code{background:#0b0e13;padding:1px 5px;border-radius:4px;font-size:12px}
 </style>
 </head>
 <body>
@@ -73,7 +78,7 @@
   </div>
 
   <div class="card">
-    <h2>Live EEG — 5&nbsp;s window, µV</h2>
+    <h2>Live EEG — 5&nbsp;s window</h2>
     <canvas id="scope" height="380"></canvas>
     <div class="legend">
       <span><i style="background:var(--c0)"></i>TP9 left ear</span>
@@ -97,6 +102,15 @@
     </div>
 
     <div class="card">
+      <h2>Heart rate — PPG pulse</h2>
+      <div class="bpm" id="bpm">--<small>waiting for 32 s of pulse data</small></div>
+      <canvas id="pulse" height="130"></canvas>
+      <div class="legend" id="pulseInfo"></div>
+    </div>
+  </div>
+
+  <div class="two">
+    <div class="card">
       <h2>Recording</h2>
       <div class="row">
         <div><label for="lab">Label</label><input id="lab" value="s01"></div>
@@ -110,11 +124,20 @@
         <button class="rec" id="btnStop" disabled>Stop</button>
       </div>
       <div class="cue" id="cue">idle<small>connect the headset to begin</small></div>
-      <div class="row">
-        <button id="btnCsv" disabled>Download eeg.csv</button>
-        <button id="btnMeta" disabled>Download meta.json</button>
-      </div>
       <div class="log" id="log" style="margin-top:12px"></div>
+    </div>
+    <div class="card">
+      <h2>Exports</h2>
+      <p style="color:var(--dim);font-size:13px;margin:0 0 12px">
+        All three files land in one folder named for the run, then
+        <code>analyze.py &lt;folder&gt;</code> reads them together — EEG band
+        powers and heart rate from the same session, on a shared clock.
+      </p>
+      <div class="row">
+        <button id="btnCsv" disabled>eeg.csv</button>
+        <button id="btnPpg" disabled>ppg.csv</button>
+        <button id="btnMeta" disabled>meta.json</button>
+      </div>
     </div>
   </div>
 </main>
@@ -131,7 +154,12 @@ const UUID_CTRL = "273e0001-4c4d-454d-96be-f03bac821358";
 const UUID_BATT = "273e000b-4c4d-454d-96be-f03bac821358";
 const UUID_EEG  = ["273e0003","273e0004","273e0005","273e0006"]
                     .map(p => p + "-4c4d-454d-96be-f03bac821358");
+const UUID_PPG  = ["273e000f","273e0010","273e0011"]
+                    .map(p => p + "-4c4d-454d-96be-f03bac821358");
 const CH   = ["TP9","AF7","AF8","TP10"];
+const PCH  = ["PPG0","PPG1","PPG2"];
+const PFS  = 64;                        // PPG sample rate per channel
+const PSPP = 6;                         // 24-bit samples per notification
 const FS   = 256;
 const SPP  = 12;                        // samples per notification
 const LSB  = 0.48828125;                // uV per least-significant bit
@@ -212,10 +240,88 @@ function drain(){
 }
 
 function recordRow(n, row){
-  if (rec.n0 < 0) rec.n0 = n;
+  if (rec.n0 < 0){ rec.n0 = n; if (rec.eegFirstMs === null) rec.eegFirstMs = performance.now(); }
   const t = (n - rec.n0) / FS;
   const marker = rec.pending; rec.pending = 0;
   rec.rows.push([t, row[0], row[1], row[2], row[3], marker]);
+}
+
+/* ---- PPG -----------------------------------------------------------------
+   Same shape as the EEG path: three characteristics arriving separately, rows
+   keyed by absolute sample number. Samples are 24-bit unsigned, six per
+   notification, and are left in raw sensor units - only their variation
+   matters for a pulse. */
+const PRING = PFS * 40;                 // 40 s: enough for a 32 s spectrum
+const pring = PCH.map(() => new Float32Array(PRING));
+let pPos = 0, pFilled = 0;
+const pRows = new Map(), pHeld = new Float32Array(3);
+let pNext = -1, pMax = -1, pGaps = 0;
+const pAbs = [-1,-1,-1], pEpoch = [0,0,0], pLast = [-1,-1,-1];
+const PALIGN = 32;                      // ~0.5 s of inter-channel jitter
+
+function pushPpg(ch, packetIndex, vals){
+  if (pLast[ch] >= 0 && packetIndex < pLast[ch] - 32768) pEpoch[ch]++;
+  pLast[ch] = packetIndex;
+  const start = (pEpoch[ch] * 65536 + packetIndex) * PSPP;
+  if (pAbs[ch] < 0) pAbs[ch] = start;
+  for (let i = 0; i < vals.length; i++){
+    const n = start + i;
+    if (n < pAbs[ch]) continue;
+    pWrite(ch, n, vals[i]);
+    pAbs[ch] = n + 1;
+  }
+}
+
+function pWrite(ch, n, v){
+  if (pNext < 0) pNext = n;
+  if (n < pNext) return;
+  let r = pRows.get(n);
+  if (!r){ r = new Float32Array(3).fill(NaN); pRows.set(n, r); }
+  r[ch] = v;
+  if (n > pMax) pMax = n;
+  pDrain();
+}
+
+function pDrain(){
+  while (pNext <= pMax){
+    const r = pRows.get(pNext);
+    const complete = r && !r.some(Number.isNaN);
+    if (!complete && pMax - pNext < PALIGN) break;
+    const row = r || new Float32Array(3).fill(NaN);
+    pRows.delete(pNext);
+    if (!complete) pGaps++;
+    for (let c = 0; c < 3; c++){
+      if (Number.isNaN(row[c])) row[c] = pHeld[c];
+      else pHeld[c] = row[c];
+      pring[c][pPos] = row[c];
+    }
+    pPos = (pPos + 1) % PRING;
+    if (pFilled < PRING) pFilled++;
+    if (rec) pRecordRow(pNext, row);
+    pNext++;
+  }
+}
+
+/* PPG rows are timestamped against the moment the first EEG sample was
+   recorded, so eeg.csv and ppg.csv share a zero despite running off separate
+   sample counters at different rates. */
+function pRecordRow(n, row){
+  if (rec.pn0 < 0){
+    rec.pn0 = n;
+    if (rec.eegFirstMs === null) rec.eegFirstMs = performance.now();
+    rec.ppgOffset = (performance.now() - rec.eegFirstMs) / 1000;
+  }
+  rec.prows.push([rec.ppgOffset + (n - rec.pn0) / PFS, row[0], row[1], row[2]]);
+}
+
+function onPpg(ch, ev){
+  const dv = ev.target.value;
+  const idx = dv.getUint16(0);
+  const b = new Uint8Array(dv.buffer).subarray(2);
+  const out = [];
+  for (let i = 0; i + 2 < b.length; i += 3)      // 24-bit unsigned samples
+    out.push((b[i] << 16) | (b[i+1] << 8) | b[i+2]);
+  pushPpg(ch, idx, out);
 }
 
 function onEeg(ch, ev){
@@ -255,6 +361,18 @@ async function connect(){
       await c.startNotifications();
       chars.push(c);
     }
+    let ppgOk = 0;
+    for (let i = 0; i < UUID_PPG.length; i++){
+      try{
+        const c = await service.getCharacteristic(UUID_PPG[i]);
+        c.addEventListener("characteristicvaluechanged", e => onPpg(i, e));
+        await c.startNotifications();
+        chars.push(c); ppgOk++;
+      }catch(_){ /* Muse 2016 has no PPG sensor */ }
+    }
+    log(ppgOk ? `PPG: ${ppgOk}/3 channels subscribed`
+              : "PPG unavailable on this headband - EEG only");
+
     try{
       const b = await service.getCharacteristic(UUID_BATT);
       b.addEventListener("characteristicvaluechanged", e =>
@@ -297,9 +415,26 @@ function startDemo(){
       }
       pushSamples(ch, Math.floor(n / SPP), vals);
     }
+    // PPG runs at 64 Hz / 6 per packet = 10.67 pkt/s, exactly half the EEG rate
+    if (Math.floor(n / SPP) % 2 === 0){
+      const pk = Math.floor(n / SPP / 2);
+      for (let ch = 0; ch < 3; ch++){
+        const vals = [];
+        for (let i = 0; i < PSPP; i++){
+          const t = (pk * PSPP + i) / PFS;
+          const hz = 66 / 60;                    // demo pulse: 66.0 bpm
+          const amp = ch === 1 ? 900 : ch === 2 ? 700 : 140;
+          vals.push(120000 + amp * (Math.sin(2*Math.PI*hz*t)
+                    + 0.35 * Math.sin(4*Math.PI*hz*t + 0.9))
+                    + 300 * Math.sin(2*Math.PI*0.05*t)
+                    + (Math.random()-0.5) * amp * 0.35);
+        }
+        pushPpg(ch, pk, vals);
+      }
+    }
     n += SPP;
   }, 1000 * SPP / FS);
-  log("demo mode: synthetic 10 Hz alpha, stronger at TP9/TP10");
+  log("demo mode: synthetic 10 Hz alpha (stronger at TP9/TP10) + 66.0 bpm pulse");
 }
 
 function teardown(msg){
@@ -314,6 +449,9 @@ function teardown(msg){
 function reset(){
   rows.clear(); nextRow = -1; maxSeen = -1; gaps = 0;
   held.fill(0); ringPos = 0; ringFilled = 0;
+  pRows.clear(); pNext = -1; pMax = -1; pGaps = 0;
+  pHeld.fill(0); pPos = 0; pFilled = 0;
+  for (let c = 0; c < 3; c++){ pring[c].fill(0); pAbs[c] = -1; pEpoch[c] = 0; pLast[c] = -1; }
   for (let c = 0; c < 4; c++){ ring[c].fill(0); abs[c] = -1; epoch[c] = 0; last[c] = -1; }
 }
 
@@ -332,13 +470,15 @@ function enable(on){
 function startRecording(protocol){
   const blocks = Math.max(1, +$("nblk").value|0);
   const blockS = Math.max(5, +$("blk").value);
-  rec = { rows: [], n0: -1, pending: protocol === "eyes" ? 1 : 0,
+  rec = { rows: [], prows: [], n0: -1, pn0: -1, eegFirstMs: null, ppgOffset: 0,
+          pending: protocol === "eyes" ? 1 : 0,
           protocol, label: $("lab").value.trim() || "run",
           blockS, blocks, lineHz: +$("linehz").value || 50,
           started: new Date().toISOString(), timeline: [], gaps0: gaps, gaps: 0 };
   $("btnGuided").disabled = true; $("btnFree").disabled = true;
   $("btnStop").disabled = false;
-  $("btnCsv").disabled = true; $("btnMeta").disabled = true;
+  $("btnCsv").disabled = true; $("btnPpg").disabled = true;
+  $("btnMeta").disabled = true;
 
   if (protocol === "eyes"){
     let step = 0;
@@ -377,9 +517,11 @@ function stopRecording(silent){
   }
   window.lastRun = r;
   $("btnCsv").disabled = false; $("btnMeta").disabled = false;
+  $("btnPpg").disabled = r.prows.length === 0;
   const secs = (r.rows.length / FS).toFixed(1);
   cue("DONE", secs + " s captured — download both files");
-  log("captured " + r.rows.length + " samples (" + secs + " s)");
+  log("captured " + r.rows.length + " EEG samples (" + secs + " s), "
+      + r.prows.length + " PPG samples");
 }
 
 function cue(big, small){ $("cue").innerHTML = big + "<small>" + small + "</small>"; }
@@ -399,6 +541,13 @@ function csvOf(r){
   return out.join("\n") + "\n";
 }
 
+function ppgCsvOf(r){
+  const out = ["time_s,PPG0,PPG1,PPG2"];
+  for (const row of r.prows)
+    out.push(row[0].toFixed(6) + "," + row.slice(1,4).map(v=>v.toFixed(6)).join(","));
+  return out.join("\n") + "\n";
+}
+
 function metaOf(r){
   const n = r.rows.length;
   return JSON.stringify({
@@ -407,7 +556,8 @@ function metaOf(r){
     protocol: r.protocol, label: r.label,
     block_s: r.blockS, blocks: r.blocks,
     duration_s: +(n / FS).toFixed(3),
-    line_hz: r.lineHz, ancillary_enabled: false,
+    line_hz: r.lineHz, ancillary_enabled: r.prows.length > 0,
+    ppg: { fs: PFS, channels: PCH, n_samples: r.prows.length },
     eeg: { fs: FS, channels: CH, n_samples: n, expected_samples: n,
            retained_pct: +(100 * (1 - r.gaps / Math.max(1, n))).toFixed(2),
            held_samples: r.gaps },
@@ -462,6 +612,69 @@ function spectrum(ch){                    // Hann-windowed periodogram, uV^2/Hz
   for (let k = 0; k < NFFT/2; k++)
     psd[k] = (re[k]*re[k] + im[k]*im[k]) / (FS * wsum) * (k ? 2 : 1);
   return psd;                             // bin k -> k * FS/NFFT Hz
+}
+
+/* Heart rate from the spectrum of the cardiac band, not by counting peaks:
+   peak counting collapses on a drifting or artifact-heavy trace, silently
+   finding a fraction of the beats. The channel is picked by how far its
+   cardiac peak stands above that band's own background. */
+const PNFFT = 2048;                     // 32 s at 64 Hz, best resolution
+const PMIN_FFT = 512;                   // 8 s: first usable estimate
+const HR_BAND = [0.7, 3.5];             // 42-210 bpm
+const HR_SNR_MIN = 8;
+
+/* Largest power-of-two window the buffer can fill, so a reading appears after
+   PMIN_FFT/PFS seconds and sharpens as more data arrives. */
+function ppgWindow(){
+  let n = PNFFT;
+  while (n > PMIN_FFT && n > pFilled) n >>= 1;
+  return n <= pFilled ? n : 0;
+}
+
+function ppgSpectrum(ch, N){
+  if (!N) return null;
+  const re = new Float64Array(N), im = new Float64Array(N);
+  let mean = 0;
+  for (let i = 0; i < N; i++){
+    const p = (pPos - N + i + PRING) % PRING;
+    re[i] = pring[ch][p]; mean += re[i];
+  }
+  mean /= N;
+  let wsum = 0;
+  for (let i = 0; i < N; i++){
+    const w = 0.5 - 0.5 * Math.cos(2*Math.PI*i/(N-1));
+    re[i] = (re[i] - mean) * w; wsum += w*w;
+  }
+  fft(re, im);
+  const psd = new Float64Array(N/2);
+  for (let k = 0; k < N/2; k++)
+    psd[k] = (re[k]*re[k] + im[k]*im[k]) / (PFS * wsum) * (k ? 2 : 1);
+  return psd;
+}
+
+function heartRate(){
+  const N = ppgWindow();
+  if (!N) return null;
+  const df = PFS / N;
+  const k0 = Math.ceil(HR_BAND[0]/df), k1 = Math.floor(HR_BAND[1]/df);
+  let best = null;
+  for (let ch = 0; ch < 3; ch++){
+    const psd = ppgSpectrum(ch, N);
+    if (!psd) continue;
+    let kMax = k0;
+    for (let k = k0; k <= k1; k++) if (psd[k] > psd[kMax]) kMax = k;
+    const band = Array.from(psd.slice(k0, k1+1)).sort((a,b)=>a-b);
+    const med = band[band.length >> 1] || 1e-30;
+    let hz = kMax * df;
+    if (kMax > k0 && kMax < k1){        // parabolic interpolation, log domain
+      const a = Math.log(psd[kMax-1]+1e-30), b = Math.log(psd[kMax]+1e-30),
+            c = Math.log(psd[kMax+1]+1e-30), den = a - 2*b + c;
+      if (den !== 0) hz += 0.5 * (a - c) / den * df;
+    }
+    const snr = psd[kMax] / med;
+    if (!best || snr > best.snr) best = { bpm: 60*hz, snr, ch, secs: N / PFS };
+  }
+  return best;
 }
 
 const BANDS = [["delta",1,4],["theta",4,8],["alpha",8,13],["beta",13,30],["gamma",30,45]];
@@ -546,6 +759,59 @@ function drawBands(){
   });
 }
 
+function drawPulse(){
+  const [g,w,h] = fit($("pulse"));
+  g.clearRect(0,0,w,h);
+  const hr = heartRate();
+  const need = PMIN_FFT - pFilled;
+
+  if (pFilled < PFS){
+    $("bpm").className = "bpm bad";
+    $("bpm").innerHTML = "--<small>no PPG data — is the headband connected?</small>";
+  } else if (!hr){
+    $("bpm").className = "bpm bad";
+    $("bpm").innerHTML = "--<small>collecting pulse data, "
+      + Math.ceil(need / PFS) + " s to go</small>";
+  } else if (hr.snr < HR_SNR_MIN){
+    $("bpm").className = "bpm bad";
+    $("bpm").innerHTML = "--<small>no pulse found — seat the band flat on the "
+      + "centre of the forehead and sit still</small>";
+  } else {
+    $("bpm").className = "bpm";
+    $("bpm").innerHTML = hr.bpm.toFixed(1)
+      + "<small>bpm &middot; " + PCH[hr.ch] + " &middot; SNR " + hr.snr.toFixed(0)
+      + (hr.snr < 50 ? " · rate only, too noisy for HRV" : " · clean")
+      + " · " + hr.secs + " s window</small>";
+  }
+  $("pulseInfo").textContent = pFilled
+    ? PCH.join(" / ") + " — " + Math.round(pFilled / PFS) + " s buffered at "
+      + PFS + " Hz" + (pGaps ? ", " + pGaps + " held samples" : "")
+    : "";
+
+  // last 6 s of the best channel, band-limited by removing its running mean
+  const ch = hr ? hr.ch : 1;
+  const span = Math.min(pFilled, PFS * 6);
+  if (span < 8) return;
+  const buf = new Float64Array(span);
+  let mean = 0;
+  for (let i = 0; i < span; i++){
+    buf[i] = pring[ch][(pPos - span + i + PRING) % PRING]; mean += buf[i];
+  }
+  mean /= span;
+  let peak = 1;
+  for (let i = 0; i < span; i++){ buf[i] -= mean;
+    if (Math.abs(buf[i]) > peak) peak = Math.abs(buf[i]); }
+  g.strokeStyle = "#f85149"; g.lineWidth = 1.4;
+  g.beginPath();
+  for (let i = 0; i < span; i++){
+    const x = w * i / span, y = h/2 - buf[i] / peak * (h * 0.42);
+    i ? g.lineTo(x,y) : g.moveTo(x,y);
+  }
+  g.stroke();
+  g.fillStyle = "#484f58"; g.font = "11px ui-monospace,monospace";
+  g.fillText(PCH[ch] + "  6 s", 6, 14);
+}
+
 function drawTable(){
   const lineHz = +$("linehz").value || 50;
   const html = CH.map((name, c) => {
@@ -576,7 +842,7 @@ function loop(){
   drawScope();
   requestAnimationFrame(loop);
 }
-setInterval(() => { drawBands(); drawTable(); }, 250);
+setInterval(() => { drawBands(); drawTable(); drawPulse(); }, 250);
 
 /* -------------------------------------------------------------------- wire -- */
 $("btnConnect").onclick    = () => { reset(); connect(); };
@@ -586,6 +852,7 @@ $("btnGuided").onclick     = () => startRecording("eyes");
 $("btnFree").onclick       = () => startRecording("continuous");
 $("btnStop").onclick       = () => stopRecording();
 $("btnCsv").onclick  = () => download("eeg.csv",   csvOf(window.lastRun),  "text/csv");
+$("btnPpg").onclick  = () => download("ppg.csv",   ppgCsvOf(window.lastRun), "text/csv");
 $("btnMeta").onclick = () => download("meta.json", metaOf(window.lastRun), "application/json");
 
 if (!navigator.bluetooth){
@@ -618,6 +885,14 @@ loop();
       nan_cells: csv.split("\n").slice(1).filter(l => l.includes("NaN")).length,
       markers: r ? r.rows.filter(x => x[5] !== 0).map(x => x[5]) : [],
       meta_ok: r ? JSON.parse(metaOf(r)).eeg.channels.join("/") : "",
+      ppg_rows: r ? r.prows.length : 0,
+      ppg_header: r ? ppgCsvOf(r).split("\n")[0] : "",
+      ppg_first: r ? (ppgCsvOf(r).split("\n")[1] || "") : "",
+      ppg_seconds: r && r.prows.length ? +(r.prows.length/PFS).toFixed(2) : 0,
+      ppg_t_end: r && r.prows.length ? +r.prows[r.prows.length-1][0].toFixed(2) : null,
+      hr: (() => { const h = heartRate();
+        return h ? {bpm: +h.bpm.toFixed(2), snr: Math.round(h.snr), chan: PCH[h.ch]}
+                 : null; })(),
       rms: [0,1,2,3].map(c => +rmsOf(c).toFixed(1)),
       alpha_frac: (() => { const ps = spectrum(0); if (!ps) return null;
         const tot = BANDS.reduce((a,[,lo,hi]) => a + bandPower(ps,lo,hi), 0);
@@ -625,7 +900,8 @@ loop();
     });
     document.body.appendChild(d);
     if (q.has("dump") && r){
-      for (const [id, txt] of [["dumpcsv", csvOf(r)], ["dumpmeta", metaOf(r)]]){
+      for (const [id, txt] of [["dumpcsv", csvOf(r)], ["dumpppg", ppgCsvOf(r)],
+                               ["dumpmeta", metaOf(r)]]){
         const e = document.createElement("pre");
         e.id = id; e.textContent = txt; document.body.appendChild(e);
       }

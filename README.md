@@ -18,7 +18,7 @@ Muse 2 ──BLE──┤                                              ├──
 
 ## Path A — browser (no install)
 
-Fastest way to see live signal. EEG only.
+Fastest way to see live signal. EEG **and** heart rate.
 
 1. Open `web/index.html` in **Chrome, Edge or Opera** (desktop or Android).
    Either serve it locally:
@@ -34,9 +34,13 @@ Fastest way to see live signal. EEG only.
 4. Check the quality table: RMS roughly 5–45 µV per channel. Blink hard; AF7/AF8
    should spike. Damp the behind-ear sensors and clear hair if a channel reads
    *no contact*.
-5. **Guided eyes open/closed** runs alternating blocks and writes condition
-   markers into the data. Then **Download eeg.csv** and **Download meta.json**
-   into `data/<label>/`.
+5. The heart-rate panel needs ~8 s of pulse data before it reads anything, and
+   sharpens up to a 32 s window. It shows bpm, which PPG channel it chose, and
+   whether the trace is clean enough for HRV.
+6. **Guided eyes open/closed** runs alternating blocks and writes condition
+   markers into the data. Then download **eeg.csv**, **ppg.csv** and
+   **meta.json** into one `data/<label>/` folder — `analyze.py` reads all three
+   together.
 
 Web Bluetooth needs a secure context, so `http://localhost` or `https://` — a
 file:// path will not work. No Safari, no Firefox, nothing on iOS.
@@ -117,7 +121,7 @@ before trusting any real recording.
 
 | Path | What |
 |---|---|
-| `web/index.html` | Self-contained Web Bluetooth EEG client — live scope, quality table, band powers, guided protocol, CSV export. No dependencies. |
+| `web/index.html` | Self-contained Web Bluetooth client — live EEG scope, per-channel quality, band powers, live heart rate from PPG, guided protocol, CSV export. No dependencies. |
 | `python/capture.py` | BrainFlow capture: EEG + PPG + IMU, guided or continuous protocols, signal-quality check. |
 | `python/analyze.py` | Shared analysis pipeline. Consumes either path's output. |
 | `python/ppg_check.py` | PPG diagnostic: per-channel quality table plus a figure of the pulse waveform with detected beats. Run it when the heart rate is missing or implausible. |
@@ -139,6 +143,10 @@ time_s,TP9,AF7,AF8,TP10,marker
 `marker` is 0 except at condition boundaries: `1` eyes-open start, `2`
 eyes-closed start, `9` run end. `meta.json` carries the sample rate, channel
 names and the protocol timeline; `analyze.py` needs both files.
+
+`ppg.csv` is `time_s,PPG0,PPG1,PPG2` at 64 Hz, timestamped against the same
+zero as `eeg.csv` so the two streams line up despite running off separate sample
+counters at different rates.
 
 Both capture paths emit this identical format, which is the point — the browser
 and the Python route are interchangeable as far as analysis is concerned.
