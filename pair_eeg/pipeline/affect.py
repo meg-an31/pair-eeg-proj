@@ -59,6 +59,9 @@ class AffectValues:
         for name, value in self.axes.items():
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"axis {name!r} out of range: {value}")
+        for name, value in self.confidence.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"confidence {name!r} out of range: {value}")
 
 
 @runtime_checkable
@@ -105,10 +108,19 @@ class Smoother:
         self._state: dict[str, float] = {}
 
     def update(self, axes: dict[str, float]) -> dict[str, float]:
+        """Smooth and return exactly the axes passed in.
+
+        Returning the whole retained state would leak axes a later mapper
+        stopped producing, so `axes` and `axes_raw` could disagree on which
+        keys exist.
+        """
+        out: dict[str, float] = {}
         for name, value in axes.items():
             prev = self._state.get(name)
-            self._state[name] = value if prev is None else self.alpha * value + (1 - self.alpha) * prev
-        return dict(self._state)
+            smoothed = value if prev is None else self.alpha * value + (1 - self.alpha) * prev
+            self._state[name] = smoothed
+            out[name] = smoothed
+        return out
 
     def reset(self) -> None:
         self._state.clear()

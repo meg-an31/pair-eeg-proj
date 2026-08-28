@@ -1,21 +1,26 @@
 """WebSocket server.
 
-One socket per client, used in both directions:
+One capture client, many viewers.
 
-    capture client  --binary-->  raw sensor frames
-                    <--json---   estimates (so the capture page can render)
-    viewer          <--json---   estimates only
+The headband allows a single BLE connection, so a second streamer could only
+ever be a mistake — a stale tab, a duplicated window, someone else opening the
+page. Rather than let two sessions race, the server admits exactly one capture
+client and rejects the rest with a message the page can explain.
 
-A client declares which it is in a `hello` message. Capture clients own a
-session; viewers subscribe to one. Both get the same estimate stream, which
-means the capture page and a separate dashboard are the same code path.
+Viewers are unlimited and read-only. They connect without knowing a session id,
+receive a snapshot on arrival, and survive the capture client coming and going,
+so a viewer left open overnight picks up tomorrow's session by itself.
+
+    capture  --binary-->  raw sensor frames
+             <--json----  estimates
+    viewer   <--json----  estimates only
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
+import time
 
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
@@ -26,13 +31,22 @@ from ..pipeline.processing import Processor
 from ..pipeline.rawlog import RawLog
 from ..pipeline.session import Session
 from ..pipeline.store import Store, new_session_id
-from .protocol import ProtocolError, decode, decode_message, encode_message, encode_payload
+from .protocol import (
+    ProtocolError,
+    decode,
+    decode_message,
+    encode_message,
+    encode_payload,
+)
 
 log = logging.getLogger("pair_eeg.server")
 
+CAPTURE = "capture"
+VIEWER = "viewer"
+
 
 class Hub:
-    """Holds the live sessions and fans estimates out to subscribers."""
+    """Holds the one live session and fans its output out to everyone."""
 
     def __init__(
         self,
@@ -44,10 +58,26 @@ class Hub:
         self.processor = processor
         self.affect = affect
         self.store = Store(config.sessions_dir)
-        self.sessions: dict[str, Session] = {}
-        self.subscribers: dict[str, set[ServerConnection]] = {}
 
-    async def open_session(self, wearer: str, ws: ServerConnection) -> Session:
+        self.session: Session | None = None
+        self.capture_ws: ServerConnection | None = None
+        self.capture_since: float | None = None
+        self.viewers: set[ServerConnection] = set()
+
+    # ----------------------------------------------------------- capture
+
+    @property
+    def capture_held(self) -> bool:
+        return self.capture_ws is not None
+
+    async def claim_capture(self, wearer: str, ws: ServerConnection) -> Session | None:
+        """Take the capture slot, or return None if it is already held."""
+        if self.capture_held:
+            return None
+
+        self.capture_ws = ws
+        self.capture_since = time.time()
+
         session_id = new_session_id()
         session_dir = self.store.create_session(wearer, session_id)
 
@@ -69,62 +99,100 @@ class Hub:
             session_id=session_id,
             wearer=wearer,
             config=self.cfg,
-            emit=lambda payload: self.broadcast(session_id, payload),
+            emit=self.broadcast,
             processor=self.processor,
             affect=self.affect,
             raw_log=raw_log,
             session_dir=session_dir,
         )
-        self.sessions[session_id] = session
-        self.subscribers.setdefault(session_id, set()).add(ws)
+        self.session = session
         await session.start()
-        log.info("session %s opened for %s -> %s", session_id, wearer, session_dir)
+
+        log.info("capture claimed by %s -> session %s (%s)", wearer, session_id, session_dir)
+        await self.tell_viewers(
+            "session_started", session=session_id, wearer=wearer
+        )
         return session
 
-    async def close_session(self, session: Session) -> None:
-        await session.stop()
-        if session.raw_log is not None:
-            await session.raw_log.close()
-        self.store.end_session(session.id)
-        self.sessions.pop(session.id, None)
-        self.subscribers.pop(session.id, None)
-        log.info("session %s closed", session.id)
-
-    async def broadcast(self, session_id: str, payload: dict) -> None:
-        peers = self.subscribers.get(session_id)
-        if not peers:
+    async def release_capture(self, ws: ServerConnection) -> None:
+        if self.capture_ws is not ws:
             return
+
+        session = self.session
+        self.capture_ws = None
+        self.capture_since = None
+        self.session = None
+
+        if session is not None:
+            await session.stop()
+            if session.raw_log is not None:
+                await session.raw_log.close()
+            self.store.end_session(session.id)
+            log.info("capture released, session %s closed", session.id)
+            await self.tell_viewers("session_ended", session=session.id)
+
+    # ----------------------------------------------------------- viewers
+
+    def add_viewer(self, ws: ServerConnection) -> None:
+        self.viewers.add(ws)
+        log.info("viewer joined (%d watching)", len(self.viewers))
+
+    def remove(self, ws: ServerConnection) -> None:
+        if ws in self.viewers:
+            self.viewers.discard(ws)
+            log.info("viewer left (%d watching)", len(self.viewers))
+
+    async def broadcast(self, payload: dict) -> None:
+        """Send one payload to the capture client and every viewer."""
         message = encode_payload(payload)
+        await self._send_all(message)
+
+    async def tell_viewers(self, kind: str, **fields) -> None:
+        await self._send_all(encode_message(kind, **fields), viewers_only=True)
+
+    async def _send_all(self, message: str, viewers_only: bool = False) -> None:
+        targets = set(self.viewers)
+        if not viewers_only and self.capture_ws is not None:
+            targets.add(self.capture_ws)
+
         dead: list[ServerConnection] = []
-        for ws in peers:
+        for ws in targets:
             try:
                 await ws.send(message)
             except websockets.ConnectionClosed:
                 dead.append(ws)
         for ws in dead:
-            peers.discard(ws)
+            self.viewers.discard(ws)
 
-    def subscribe(self, session_id: str, ws: ServerConnection) -> Session | None:
-        session = self.sessions.get(session_id)
-        if session is not None:
-            self.subscribers.setdefault(session_id, set()).add(ws)
-        return session
-
-    def unsubscribe(self, ws: ServerConnection) -> None:
-        for peers in self.subscribers.values():
-            peers.discard(ws)
+    def status(self) -> dict:
+        """What a client is told on arrival when there is no live session."""
+        return {
+            "type": "status",
+            "capture_held": self.capture_held,
+            "viewers": len(self.viewers),
+            "session": self.session.id if self.session else None,
+            "uptime_s": round(time.time() - self.capture_since, 1)
+            if self.capture_since
+            else None,
+            "stages": {
+                "processing": getattr(self.processor, "name", "null_v0"),
+                "affect": getattr(self.affect, "name", "null_v0"),
+            },
+        }
 
 
 async def handle(ws: ServerConnection, hub: Hub) -> None:
+    role: str | None = None
     session: Session | None = None
-    owns_session = False
 
     try:
         async for raw in ws:
-            # ---- binary: sensor data --------------------------------
+            # ---- binary: sensor data, capture client only ---------------
             if isinstance(raw, (bytes, bytearray)):
-                if session is None:
-                    await ws.send(encode_message("error", detail="send hello first"))
+                if role != CAPTURE or session is None:
+                    await ws.send(
+                        encode_message("error", detail="only the capture client may send data")
+                    )
                     continue
                 try:
                     session.ingest(decode(bytes(raw)))
@@ -132,7 +200,7 @@ async def handle(ws: ServerConnection, hub: Hub) -> None:
                     await ws.send(encode_message("error", detail=str(exc)))
                 continue
 
-            # ---- text: control --------------------------------------
+            # ---- text: control ------------------------------------------
             try:
                 msg = decode_message(raw)
             except ProtocolError as exc:
@@ -142,21 +210,58 @@ async def handle(ws: ServerConnection, hub: Hub) -> None:
             kind = msg.get("type")
 
             if kind == "hello":
-                role = msg.get("role", "capture")
-                if role == "capture":
-                    session = await hub.open_session(msg.get("wearer", "unknown"), ws)
-                    owns_session = True
-                else:
-                    session = hub.subscribe(msg.get("session", ""), ws)
+                if role is not None:
+                    await ws.send(encode_message("error", detail="already introduced"))
+                    continue
+
+                requested = msg.get("role", VIEWER)
+
+                if requested == CAPTURE:
+                    session = await hub.claim_capture(msg.get("wearer", "unknown"), ws)
                     if session is None:
-                        await ws.send(encode_message("error", detail="no such session"))
+                        await ws.send(
+                            encode_message(
+                                "capture_busy",
+                                detail=(
+                                    "Another device is already streaming. Only one "
+                                    "headband can be connected at a time — close the "
+                                    "other capture tab, or join as a viewer instead."
+                                ),
+                                **{k: v for k, v in hub.status().items() if k != "type"},
+                            )
+                        )
                         continue
-                await ws.send(encode_payload(session.snapshot()))
+                    role = CAPTURE
+                    await ws.send(encode_payload(session.snapshot()))
+                else:
+                    role = VIEWER
+                    hub.add_viewer(ws)
+                    if hub.session is not None:
+                        await ws.send(encode_payload(hub.session.snapshot()))
+                    else:
+                        await ws.send(encode_payload(hub.status()))
+                continue
 
-            elif session is None:
+            if role is None:
                 await ws.send(encode_message("error", detail="send hello first"))
+                continue
 
-            elif kind == "baseline":
+            if kind == "ping":
+                await ws.send(encode_message("pong"))
+                continue
+
+            if kind == "status":
+                await ws.send(encode_payload(hub.status()))
+                continue
+
+            # Everything below changes session state — capture client only.
+            if role != CAPTURE or session is None:
+                await ws.send(
+                    encode_message("error", detail="viewers cannot control the session")
+                )
+                continue
+
+            if kind == "baseline":
                 session.begin_baseline()
                 await ws.send(encode_payload(session.snapshot()))
 
@@ -170,18 +275,15 @@ async def handle(ws: ServerConnection, hub: Hub) -> None:
                         {"t": msg.get("t"), "label": msg.get("label"), "meta": msg.get("meta")}
                     )
 
-            elif kind == "ping":
-                await ws.send(encode_message("pong"))
-
             else:
                 await ws.send(encode_message("error", detail=f"unknown type {kind!r}"))
 
     except websockets.ConnectionClosed:
         pass
     finally:
-        hub.unsubscribe(ws)
-        if session is not None and owns_session:
-            await hub.close_session(session)
+        hub.remove(ws)
+        if role == CAPTURE:
+            await hub.release_capture(ws)
 
 
 async def run(
@@ -190,8 +292,16 @@ async def run(
     affect: AffectMapper | None = None,
 ) -> None:
     hub = Hub(config, processor=processor, affect=affect)
-    async with serve(lambda ws: handle(ws, hub), config.host, config.port, max_size=2**20):
+    async with serve(
+        lambda ws: handle(ws, hub),
+        config.host,
+        config.port,
+        max_size=2**20,
+        ping_interval=20,
+        ping_timeout=20,
+    ):
         log.info("listening on ws://%s:%d", config.host, config.port)
+        log.info("one capture client, unlimited viewers")
         log.info(
             "processing=%s  affect=%s",
             getattr(processor, "name", "null_v0"),

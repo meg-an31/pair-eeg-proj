@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Affect stream</title>
+<style>
+  :root{
+    --bg:#0e1015; --panel:#161921; --line:#282d38;
+    --ink:#e8eaef; --dim:#8d94a4; --accent:#8f9cf1;
+    --ok:#4fbf98; --warn:#dd9a5c; --bad:#e2727c;
+  }
+  @media (prefers-color-scheme:light){
+    :root:not([data-theme="dark"]){
+      --bg:#eceef2; --panel:#fff; --line:#d4d8e1;
+      --ink:#171a21; --dim:#6e7585; --accent:#3f4fb6;
+      --ok:#1c7355; --warn:#a2571f; --bad:#a52e39;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:13px;line-height:1.5}
+  header{padding:16px 20px;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  h1{font-size:14px;margin:0;font-weight:600}
+  main{padding:20px;display:grid;gap:16px;max-width:760px;margin:0 auto}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:16px 18px}
+  .panel h2{font-size:10px;text-transform:uppercase;letter-spacing:.12em;
+    color:var(--dim);margin:0 0 14px;font-weight:500}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;
+    border-radius:99px;border:1px solid var(--line);font-size:11px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--dim)}
+  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+  .axes{display:grid;gap:14px}
+  .axis{display:grid;grid-template-columns:96px 1fr 48px;align-items:center;gap:12px}
+  .axis .name{color:var(--dim);font-size:11px}
+  .bar{height:10px;background:var(--bg);border:1px solid var(--line);
+    border-radius:99px;overflow:hidden;position:relative}
+  .bar i{display:block;height:100%;background:var(--accent);width:50%;
+    transition:width .3s cubic-bezier(.4,0,.2,1)}
+  .bar::after{content:"";position:absolute;left:50%;top:0;bottom:0;
+    width:1px;background:var(--line)}
+  .val{text-align:right;font-variant-numeric:tabular-nums;font-size:11px}
+  .note{color:var(--dim);font-size:11px;margin:14px 0 0}
+  .note.warn{color:var(--warn)}
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.1em;
+    color:var(--dim);font-weight:500;padding:5px 8px 5px 0}
+  td{padding:4px 8px 4px 0;border-top:1px solid var(--line)}
+  .idle{color:var(--dim);text-align:center;padding:28px 0}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Affect stream</h1>
+  <span class="pill"><span class="dot" id="dot"></span><span id="status">connecting…</span></span>
+  <span class="pill" id="statePill">state: —</span>
+  <span style="flex:1"></span>
+  <span class="pill" id="viewers">—</span>
+</header>
+
+<main>
+  <div class="panel">
+    <h2>Axes — 0 to 1, 0.5 is the wearer's baseline</h2>
+    <div class="axes" id="axes"></div>
+    <p class="note" id="note"></p>
+  </div>
+
+  <div class="panel">
+    <h2>Signal</h2>
+    <table>
+      <tr><th>Session</th><td id="session">—</td></tr>
+      <tr><th>Accept rate</th><td id="accept">—</td></tr>
+      <tr><th>Calibrated</th><td id="calibrated">—</td></tr>
+      <tr><th>Updated</th><td id="updated">—</td></tr>
+    </table>
+  </div>
+</main>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const AXES = ["valence","arousal","direction","engagement","autonomic"];
+
+const params = new URLSearchParams(location.search);
+const WS_URL = params.get("server")
+  || (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+
+const els = {};
+for (const name of AXES){
+  const row = document.createElement("div");
+  row.className = "axis";
+  row.innerHTML = `<span class="name">${name}</span>
+    <span class="bar"><i></i></span><span class="val">—</span>`;
+  $("axes").appendChild(row);
+  els[name] = { fill: row.querySelector("i"), val: row.querySelector(".val") };
+}
+
+function setDot(cls, text){
+  $("dot").className = "dot" + (cls ? " " + cls : "");
+  $("status").textContent = text;
+}
+
+let ws = null, attempt = 0, lastUpdate = 0;
+
+function connect(){
+  setDot("warn", "connecting…");
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    attempt = 0;
+    setDot("ok", "connected");
+    ws.send(JSON.stringify({ type: "hello", role: "viewer" }));
+  };
+
+  ws.onclose = () => {
+    setDot("bad", "disconnected");
+    const delay = Math.min(500 * 2 ** attempt++, 10000);
+    setTimeout(connect, delay);
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") return;
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+
+    if (msg.type === "status"){
+      $("session").textContent = msg.session ?? "none";
+      $("viewers").textContent = `${msg.viewers} watching`;
+      if (!msg.capture_held){
+        $("statePill").textContent = "state: idle";
+        $("note").textContent = "No headband streaming right now.";
+        $("note").className = "note";
+        for (const a of AXES){ els[a].fill.style.width = "50%"; els[a].val.textContent = "—"; }
+      }
+      return;
+    }
+
+    if (msg.type === "session_started"){
+      $("session").textContent = msg.session;
+      $("note").textContent = "";
+      return;
+    }
+
+    if (msg.type === "session_ended"){
+      $("statePill").textContent = "state: idle";
+      $("note").textContent = "Streaming stopped.";
+      return;
+    }
+
+    if (msg.type === "snapshot"){
+      $("session").textContent = msg.session ?? "—";
+      $("statePill").textContent = "state: " + (msg.state ?? "—");
+      if (msg.stages && msg.stages.affect?.startsWith("null")){
+        $("note").className = "note warn";
+        $("note").textContent =
+          "Affect stage not implemented — axes are pinned to 0.5.";
+      }
+      return;
+    }
+
+    if (msg.type !== "estimate") return;
+
+    $("statePill").textContent = "state: " + msg.state
+      + (msg.baseline ? ` ${(msg.baseline.progress*100).toFixed(0)}%` : "");
+    if (msg.quality) $("accept").textContent = (msg.quality.accept_rate*100).toFixed(0) + "%";
+    if (msg.affect){
+      $("calibrated").textContent = msg.affect.calibrated ? "yes" : "no";
+      if (!msg.affect.implemented){
+        $("note").className = "note warn";
+        $("note").textContent = "Affect stage not implemented — axes pinned to 0.5.";
+      } else {
+        $("note").textContent = "";
+      }
+    }
+    if (msg.axes){
+      for (const [name, value] of Object.entries(msg.axes)){
+        const el = els[name]; if (!el) continue;
+        el.fill.style.width = (value*100).toFixed(1) + "%";
+        el.val.textContent = value.toFixed(2);
+      }
+      lastUpdate = Date.now();
+    }
+  };
+}
+
+setInterval(() => {
+  $("updated").textContent = lastUpdate
+    ? Math.round((Date.now()-lastUpdate)/1000) + "s ago" : "—";
+}, 1000);
+
+connect();
+</script>
+</body>
+</html>

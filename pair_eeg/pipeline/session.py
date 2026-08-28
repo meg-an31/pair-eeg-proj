@@ -69,7 +69,10 @@ class Baseline:
         self.n += 1
 
     def freeze(self) -> None:
-        if self.frozen or self.n == 0:
+        # No observed features means no calibration, whatever the tick count
+        # says. Claiming otherwise would put `calibrated: true` on a payload
+        # normalised against nothing.
+        if self.frozen or self.n == 0 or not self._sum:
             return
         for key, total in self._sum.items():
             mean = total / self.n
@@ -140,6 +143,7 @@ class Session:
         self._degraded_since: float | None = None
         self._frames_in = 0
         self._discontinuities = 0
+        self._last_ingest: float | None = None
 
     # ------------------------------------------------------------------ io
 
@@ -153,6 +157,7 @@ class Session:
             self._discontinuities += 1
         buf.write(frame.counter, frame.samples)
         self._frames_in += 1
+        self._last_ingest = time.time()
 
         if self.state is SessionState.CONNECTING:
             self._transition(SessionState.FIT_CHECK)
@@ -174,13 +179,18 @@ class Session:
 
     def begin_baseline(self) -> None:
         """Start the eyes-open rest block. Idempotent."""
-        if self.state in (SessionState.FIT_CHECK, SessionState.LIVE):
+        if self.state in (SessionState.FIT_CHECK, SessionState.LIVE, SessionState.DEGRADED):
             self.baseline = Baseline()
             self._baseline_started = time.time()
+            # Old smoother state was normalised against the previous
+            # baseline; carrying it across would blend two calibrations.
+            self.smoother.reset()
             self._transition(SessionState.BASELINE)
 
     def skip_baseline(self) -> None:
         """Go live uncalibrated. Values will be flagged `calibrated: false`."""
+        if self.state in (SessionState.ENDED, SessionState.CONNECTING):
+            return
         self._transition(SessionState.LIVE)
 
     def _transition(self, state: SessionState) -> None:
@@ -199,6 +209,9 @@ class Session:
         while True:
             await asyncio.sleep(self.cfg.hop_s)
 
+            if await self._check_stalled():
+                continue
+
             if eeg.empty or eeg.available() < window_n:
                 continue
 
@@ -214,6 +227,42 @@ class Session:
                     break
                 await self._tick(start, window_n)
                 self._next_epoch_end += hop_n
+
+    async def _check_stalled(self) -> bool:
+        """Report a stream that has stopped arriving.
+
+        Everything else runs off `_tick`, which only fires when there is data
+        to epoch — so without this a dead capture client would leave the state
+        at LIVE indefinitely and viewers would see a stale reading as current.
+        """
+        if self._last_ingest is None or self.state in (
+            SessionState.ENDED,
+            SessionState.CONNECTING,
+        ):
+            return False
+
+        quiet = time.time() - self._last_ingest
+        if quiet < max(3.0 * self.cfg.hop_s, 2.0):
+            return False
+
+        if self.state is not SessionState.DEGRADED:
+            self._transition(SessionState.DEGRADED)
+
+        self._seq += 1
+        await self.emit(
+            {
+                **self._envelope(
+                    QualityVerdict(
+                        accepted=False,
+                        channels={c: "flat" for c in EEG.channels},
+                        fill_ratio=0.0,
+                        reason=f"no data for {quiet:.1f}s",
+                    )
+                ),
+                **self._empty_fields(),
+            }
+        )
+        return True
 
     async def _tick(self, start: int, window_n: int) -> None:
         eeg_window = self.buffers[EEG.name].read(start, window_n)
@@ -253,8 +302,15 @@ class Session:
         buf = self.buffers[stream.name]
         if buf.empty:
             return None
+        # NOTE: assumes this stream shares a counter origin with EEG. That
+        # holds for the synthetic client and for BrainFlow, but the browser
+        # decodes a separate counter per characteristic, so PPG and IMU need
+        # time-based alignment before they can be trusted here.
         ratio = stream.rate_hz / EEG.rate_hz
-        return buf.read(int(eeg_start * ratio), max(1, int(eeg_n * ratio))).samples
+        window = buf.read(int(eeg_start * ratio), max(1, int(eeg_n * ratio)))
+        if window.n_missing == window.n_samples:
+            return None          # entirely absent, not merely gappy
+        return window.samples
 
     def _update_state(self, verdict: QualityVerdict) -> None:
         now = time.time()
@@ -312,13 +368,30 @@ class Session:
             },
         }
 
+    def _empty_fields(self) -> dict:
+        """Every optional field, so the key set never varies by variant."""
+        return {
+            "channels": list(EEG.channels),
+            "freqs_hz": None,
+            "spectrum": None,
+            "bands": None,
+            "band_names": None,
+            "processing": None,
+            "baseline": None,
+            "axes": None,
+            "axes_raw": None,
+            "confidence": None,
+            "affect": None,
+        }
+
     def _quality_only_payload(self, verdict: QualityVerdict) -> dict:
-        return {**self._envelope(verdict), "axes": None, "spectrum": None, "bands": None}
+        return {**self._envelope(verdict), **self._empty_fields()}
 
     def _baseline_payload(self, verdict: QualityVerdict, features: ProcessedFeatures) -> dict:
         elapsed = time.time() - (self._baseline_started or time.time())
         return {
             **self._envelope(verdict),
+            **self._empty_fields(),
             "baseline": {
                 "elapsed_s": round(elapsed, 1),
                 "total_s": self.cfg.baseline_s,
@@ -326,7 +399,6 @@ class Session:
                 "n": self.baseline.n,
             },
             **self._spectral(features),
-            "axes": None,
         }
 
     def _spectral(self, features: ProcessedFeatures) -> dict:
@@ -351,6 +423,7 @@ class Session:
     ) -> dict:
         return {
             **self._envelope(verdict),
+            **self._empty_fields(),
             **self._spectral(features),
             "axes": {k: round(v, 4) for k, v in smoothed.items()},
             "axes_raw": {k: round(v, 4) for k, v in values.axes.items()},

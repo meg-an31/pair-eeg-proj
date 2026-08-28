@@ -49,6 +49,9 @@ class RingBuffer:
     current head resets the buffer rather than spinning through the gap.
     """
 
+    # Consecutive far-behind writes before we call it a counter restart.
+    RESTART_AFTER = 3
+
     def __init__(self, stream: StreamSpec, capacity: int):
         if capacity <= 0:
             raise ValueError("capacity must be positive")
@@ -58,6 +61,7 @@ class RingBuffer:
         self._written = np.zeros(self.capacity, dtype=bool)
         self._head = 0          # one past the highest counter written
         self._origin: int | None = None
+        self._behind_run = 0    # consecutive writes far behind the head
 
     # -- state ---------------------------------------------------------
 
@@ -97,11 +101,29 @@ class RingBuffer:
         if self._origin is None:
             self._origin = counter
 
-        # A jump larger than the buffer means everything retained is stale.
-        if counter >= self._head + self.capacity:
+        # A forward jump larger than the buffer means everything retained is
+        # stale — a long dropout.
+        #
+        # A write far BEHIND the head is ambiguous: one is a very late frame
+        # and should be dropped, but a run of them means the device
+        # reconnected and restarted its counter. Left undetected, a restart
+        # stalls the stream until the counter climbs back past the old head,
+        # which for a fresh session is never. So take persistence as the
+        # signal rather than any single write.
+        far_behind = counter + self.capacity <= self._head
+        if far_behind:
+            self._behind_run += 1
+        else:
+            self._behind_run = 0
+
+        restarted = far_behind and self._behind_run >= self.RESTART_AFTER
+
+        if counter >= self._head + self.capacity or restarted:
             self._data.fill(np.nan)
             self._written.fill(False)
             self._origin = counter
+            self._head = counter
+            self._behind_run = 0
 
         end = counter + n
         # Advancing the head invalidates the slots the wrap is about to reuse.
