@@ -180,7 +180,7 @@ const last  = CH.map(() => -1);
 
 let device = null, chars = [], demoTimer = null, packets = 0, packetT0 = 0;
 let demoBpm = 66.0, demoDrift = false, demoArtifact = 0, demoHarm2 = false;
-let demoBrpm = 14.0, demoRed = false, demoBpm2 = 0, demoSwitchAt = 60;
+let demoBrpm = 14.0, demoRed = false, demoBpm2 = 0, demoBrpm2 = 0, demoSwitchAt = 60;
 const demoRedState = [0, 0, 0];
 let rec = null;                         // {rows, t0, markers, protocol, ...}
 let guided = null;                      // guided-protocol timer state
@@ -432,8 +432,9 @@ function startDemo(){
           const t = (pk * PSPP + i) / PFS;
           const hz = (demoBpm2 && t >= demoSwitchAt ? demoBpm2 : demoBpm) / 60;
           let amp = ch === 1 ? 900 : ch === 2 ? 700 : 140;
-          const breath = demoBrpm > 0
-            ? 0.55 * amp * Math.sin(2*Math.PI*(demoBrpm/60)*t + ch) : 0;
+          const br = demoBrpm2 && t >= demoSwitchAt ? demoBrpm2 : demoBrpm;
+          const breath = br > 0
+            ? 0.55 * amp * Math.sin(2*Math.PI*(br/60)*t + ch) : 0;
           let wander = 300 * Math.sin(2*Math.PI*0.05*t);
           if (demoRed){        // AR(1) random walk: realistic vasomotor/sway drift
             demoRedState[ch] = 0.995 * demoRedState[ch] + (Math.random()-0.5) * 208;
@@ -489,7 +490,7 @@ function teardown(msg){
 function reset(){
   rows.clear(); nextRow = -1; maxSeen = -1; gaps = 0;
   held.fill(0); ringPos = 0; ringFilled = 0;
-  hrAcc = []; hrRejectRun = 0; brHist = [];
+  hrAcc = []; hrRejectRun = 0; brAcc = []; brRejectRun = 0;
   pRows.clear(); pNext = -1; pMax = -1; pGaps = 0;
   pHeld.fill(0); pPos = 0; pFilled = 0;
   for (let c = 0; c < 3; c++){ pring[c].fill(0); pAbs[c] = -1; pEpoch[c] = 0; pLast[c] = -1; }
@@ -818,7 +819,29 @@ function hrUpdate(bpm, now){
    the cardiac band. Same estimator, different band and a narrower whitening
    width, plus a longer window: 64 s gives ~0.9 brpm bin resolution. */
 const BR_BAND = [0.08, 0.66], BR_SNR_MIN = 12, BR_NFFT = 4096, BR_MIN_FFT = 2048;
-let brHist = [];
+/* Same display pipeline as the heart rate: a one-minute trimmed running
+   average. Constants differ because breathing does: rates are small numbers
+   (a 4/min absolute floor on the rejection band, or genuine breath-to-breath
+   variation gets rejected), and people CHANGE their breathing at will - paced
+   slow breathing is a standard demo - so the stale-window escape triggers
+   after ~20 s of consecutive rejections. */
+const BR_WIN_MS = 60000, BR_REJECT_FRAC = 0.35, BR_STALE_FRAMES = 80;
+let brAcc = [], brRejectRun = 0;
+
+function brUpdate(brpm, now){
+  while (brAcc.length && now - brAcc[0].t > BR_WIN_MS) brAcc.shift();
+  const n = brAcc.length;
+  const avg = n ? brAcc.reduce((a,o) => a + o.brpm, 0) / n : null;
+  if (avg !== null && n >= 12 &&
+      Math.abs(brpm - avg) > Math.max(4, BR_REJECT_FRAC * avg)){
+    if (++brRejectRun >= BR_STALE_FRAMES){ brAcc = []; brRejectRun = 0; }
+    return { avg, n, rejected: true };
+  }
+  brRejectRun = 0;
+  brAcc.push({ t: now, brpm });
+  return { avg: brAcc.reduce((a,o) => a + o.brpm, 0) / brAcc.length,
+           n: brAcc.length, rejected: false };
+}
 
 /* Background for the breathing band: the 25th percentile of an annulus around
    each bin (3-12 bins away, both sides). A plain rolling median masks closely
@@ -896,14 +919,16 @@ function breathRate(){
   }
   if (!best) return null;
   if (best.ambiguous) return { ambiguous: true, snr: best.snr, ch: best.ch,
-                               secs: best.secs, n: brHist.length };
-  brHist.push(best.brpm);
-  if (brHist.length > HR_HIST) brHist.shift();
-  const sorted = brHist.slice().sort((a,b) => a-b);
-  const med = sorted[sorted.length >> 1];
-  const spread = brHist.length >= 4 ? (sorted[sorted.length-1]-sorted[0])/med : 0;
-  return { brpm: med, snr: best.snr, ch: best.ch, secs: best.secs,
-           spread, n: brHist.length };
+                               secs: best.secs, n: brAcc.length };
+  if (best.snr < BR_SNR_MIN)          // below evidence gate: never feeds the average
+    return { brpm: null, snr: best.snr, ch: best.ch, secs: best.secs, n: brAcc.length };
+  const now = performance.now();
+  const st = brUpdate(best.brpm, now);
+  const spanS = brAcc.length ? (now - brAcc[0].t) / 1000 : 0;
+  return { brpm: st.avg, n: st.n, spanS: Math.round(spanS),
+           snr: best.snr, ch: best.ch, secs: best.secs,
+           rejected: st.rejected,
+           acquiring: st.n < 15 || spanS < 15 };
 }
 
 function heartRate(){
@@ -1092,25 +1117,22 @@ function drawBreath(){
     el.className = "breath bad";
     el.innerHTML = "breathing --<small>needs " +
       Math.max(1, Math.ceil((BR_MIN_FFT - pFilled) / PFS)) + " s more data</small>";
-  } else if (br.n < 8){
-    el.className = "breath bad";
-    el.innerHTML = "breathing --<small>settling…</small>";
   } else if (br.ambiguous){
     el.className = "breath bad";
     el.innerHTML = "breathing --<small>several slow rhythms present — sit still, "
       + "breathe evenly</small>";
-  } else if (br.snr < BR_SNR_MIN){
+  } else if (br.brpm === null){
     el.className = "breath bad";
     el.innerHTML = "breathing --<small>no respiratory rhythm above the noise</small>";
-  } else if (br.spread > 0.15 && br.n >= 6){
+  } else if (br.acquiring){
     el.className = "breath bad";
     el.innerHTML = "breathing ~" + br.brpm.toFixed(0)
-      + "<small>unstable — breathe evenly for a moment</small>";
+      + "<small>acquiring — averaging begins after ~15 s of steady rhythm</small>";
   } else {
     el.className = "breath";
     el.innerHTML = "breathing " + br.brpm.toFixed(1)
-      + " /min<small>" + PCH[br.ch] + " · SNR " + br.snr.toFixed(0)
-      + " · " + br.secs + " s window</small>";
+      + " /min<small>" + Math.min(60, br.spanS) + " s average · " + PCH[br.ch]
+      + " · SNR " + br.snr.toFixed(0) + "</small>";
   }
 }
 
@@ -1176,7 +1198,7 @@ loop();
     if (h.snr < HR_SNR_MIN || h.acquiring || h.bpm === null) window.hrBlank++;
     else window.hrSeries.push(+h.bpm.toFixed(1));
     const b = breathRate();
-    if (b && !b.ambiguous && b.n >= 8 && b.snr >= BR_SNR_MIN && b.spread <= 0.15)
+    if (b && !b.ambiguous && !b.acquiring && b.brpm !== null)
       window.brSeries.push(+b.brpm.toFixed(1)); }, 1000);
   demoDrift = q.has("drift");
   demoArtifact = q.has("artifact") ? (parseFloat(q.get("artifact")) || 2.83) : 0;
@@ -1187,6 +1209,7 @@ loop();
   }
   demoRed = q.has("rednoise");
   demoBpm2 = parseFloat(q.get("bpm2")) || 0;
+  demoBrpm2 = parseFloat(q.get("brpm2")) || 0;
   demoSwitchAt = parseFloat(q.get("switchat")) || 60;
   startDemo();
   const secs = +q.get("rec") || 0;
@@ -1240,3 +1263,4 @@ loop();
 </script>
 </body>
 </html>
+ 
