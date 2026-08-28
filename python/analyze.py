@@ -72,7 +72,7 @@ def epoch(eeg, t, labels, fs, win_s=2.0, overlap=0.5, reject_uv=150.0, edge_s=1.
     block edge (transition smear), or exceed the amplitude threshold."""
     step = int(win_s * fs * (1 - overlap))
     n_win = int(win_s * fs)
-    epochs, conds, kept, dropped = [], [], 0, 0
+    epochs, conds, kept, dropped, peaks = [], [], 0, 0, []
 
     # samples where the condition label changes = block boundaries
     change = np.flatnonzero(labels[1:] != labels[:-1]) + 1
@@ -86,13 +86,15 @@ def epoch(eeg, t, labels, fs, win_s=2.0, overlap=0.5, reject_uv=150.0, edge_s=1.
         if edges.size and np.any(np.abs(edges - t[s]) < edge_s):
             continue
         seg = eeg[:, s:e]
-        if np.max(np.abs(seg - seg.mean(axis=1, keepdims=True))) > reject_uv:
+        pk = float(np.max(np.abs(seg - seg.mean(axis=1, keepdims=True))))
+        peaks.append(pk)
+        if pk > reject_uv:
             dropped += 1
             continue
         epochs.append(seg)
         conds.append(seg_labels[0])
         kept += 1
-    return np.array(epochs), np.array(conds), kept, dropped
+    return np.array(epochs), np.array(conds), kept, dropped, np.array(peaks)
 
 
 # ------------------------------------------------------------- spectral ------
@@ -233,21 +235,33 @@ def main():
 
     clean = preprocess(raw, fs, line_hz)
     labels = label_samples(t, marker, meta)
-    epochs, conds, kept, dropped = epoch(clean, t, labels, fs,
-                                         win_s=args.win, reject_uv=args.reject_uv)
+    epochs, conds, kept, dropped, peaks = epoch(clean, t, labels, fs,
+                                                win_s=args.win, reject_uv=args.reject_uv)
     if kept == 0:
-        raise SystemExit("No clean epochs survived. Loosen --reject-uv or check the recording.")
-    print(f"  epochs: {kept} kept, {dropped} rejected (>{args.reject_uv:.0f} uV)")
-    for c in sorted(set(conds)):
-        print(f"    {c}: {(conds == c).sum()}")
+        print(f"\n  No clean EEG epochs: all {dropped} windows exceeded "
+              f"{args.reject_uv:.0f} uV.")
+        if peaks.size:
+            qs = np.percentile(peaks, [10, 50, 90])
+            print(f"  Window peak amplitude: median {qs[1]:.0f} uV, "
+                  f"10th pct {qs[0]:.0f}, 90th pct {qs[2]:.0f}")
+            print(f"  --reject-uv {int(np.ceil(qs[0] / 50) * 50)} would keep "
+                  f"about 10% of windows.")
+            if qs[1] > 500:
+                print("  A median above ~500 uV is an electrode-contact problem, not"
+                      " brain activity - raising the threshold analyses noise.")
+        print("  Skipping EEG spectral analysis; PPG is unaffected and continues.\n")
+    else:
+        print(f"  epochs: {kept} kept, {dropped} rejected (>{args.reject_uv:.0f} uV)")
+        for c in sorted(set(conds)):
+            print(f"    {c}: {(conds == c).sum()}")
 
-    f, p = psd(epochs, fs)
+    f, p = psd(epochs, fs) if kept else (None, None)
 
     results = {"run": run_dir.name, "fs": fs, "line_hz": line_hz,
                "epochs_kept": kept, "epochs_rejected": dropped,
                "band_power_abs": {}, "band_power_rel": {}, "contrasts": {}}
 
-    for c in sorted(set(conds)):
+    for c in (sorted(set(conds)) if kept else []):
         m = conds == c
         results["band_power_abs"][c] = {}
         results["band_power_rel"][c] = {}
@@ -260,7 +274,7 @@ def main():
                 for b, rng_ in BANDS.items()}
 
     # eyes-closed vs eyes-open contrast
-    if {"eyes_open", "eyes_closed"} <= set(conds):
+    if kept and {"eyes_open", "eyes_closed"} <= set(conds):
         mo, mc = conds == "eyes_open", conds == "eyes_closed"
         print("\n  Alpha (8-13 Hz), eyes-closed vs eyes-open:")
         print(f"    {'chan':6} {'open':>9} {'closed':>9} {'ratio':>7} {'d':>7} {'p':>10}")
@@ -299,7 +313,7 @@ def main():
                             f"{results['band_power_rel'][c][nm][b]}")
     (run_dir / "band_powers.csv").write_text("\n".join(rows) + "\n")
 
-    if not args.no_figures:
+    if not args.no_figures and kept:
         make_figures(t, raw, clean, names, f, p, conds, results, fs,
                      run_dir / "figures", line_hz)
         print(f"\n  figures -> {run_dir / 'figures'}/")
