@@ -145,3 +145,173 @@ class Smoother:
 
     def reset(self) -> None:
         self._state.clear()
+
+
+# --------------------------------------------------------------------------
+# The real affect stage: the ~/projects/muse scorer, unaltered
+# --------------------------------------------------------------------------
+#
+# muse's `score.score_epoch` is used as-is. It takes the epoch's per-window
+# feature rows plus a resting baseline and returns valence, arousal and
+# tension, each in -1..+1, with a per-axis confidence. This class does three
+# things around it, and no scoring of its own.
+#
+# **1. It builds the baseline from the resting block.** `RestingBaseline`
+# carries the raw resting samples, which is exactly what muse's
+# `compute_baseline` wants — it is handed a `preprocess_eeg` output. Derived
+# once and cached, because it re-runs the whole preprocessing chain over two
+# minutes of samples and could not do that every hop.
+#
+# **2. It converts -1..+1 into the 0-1 axis contract.** `(x + 1) / 2`, so
+# muse's 0 — the wearer's own resting level — lands on 0.5, which is what this
+# module's contract says 0.5 means. The two conventions agree exactly; only
+# the arithmetic differs.
+#
+# **3. It unfolds two axes muse already computes but keeps folded in.**
+# `direction` is frontal alpha asymmetry and `engagement` is beta/(alpha+theta):
+# muse computes both per window and then feeds them into valence and arousal as
+# voters. The front end wants them separately — valence and arousal alone
+# cannot separate anger from fear, and motivational direction is what does — so
+# they are read from the same sign-aligned z-scores the scorer produced, which
+# keeps them consistent with the axes they also contribute to rather than
+# recomputed by a second route.
+#
+# `autonomic` is muse's heart and breathing evidence. Nothing supplies those
+# streams yet (see MuseProcessor._autonomic), so it reports NEUTRAL with zero
+# confidence rather than a value — Invariant 6.
+
+import numpy as np                                            # noqa: E402
+
+from .muse.baseline import compute_baseline                    # noqa: E402
+from .muse.preprocess import preprocess_eeg                    # noqa: E402
+from .muse.score import score_epoch                            # noqa: E402
+
+# Which sign-aligned z-score each unfolded axis is read from, and the scale
+# that turns it into a 0-1 position. tanh(z/2) is muse's own squash — the same
+# one score_epoch applies to a combined axis — so a z of 2 sits at the same
+# distance from centre here as it would inside valence or arousal.
+UNFOLDED = {"direction": "z_faa", "engagement": "z_engagement"}
+
+# Confidence for an unfolded single-index axis. Lower than a combined axis can
+# reach, because muse's confidence is *agreement between indices* and a lone
+# index has nothing to agree with — score_epoch says the same thing when it
+# assigns a single-index axis a mediocre spread of 1.0.
+SINGLE_INDEX_CONFIDENCE = 0.5
+
+
+def to_unit(value: float) -> float:
+    """muse's -1..+1 onto this module's 0-1, with 0 -> 0.5 (= resting).
+
+    Clipped rather than trusted: the axis contract is enforced by
+    AffectValues, and a tanh that returns exactly +-1.0 in float arithmetic
+    would otherwise sit precisely on the boundary.
+    """
+    if value is None or not np.isfinite(value):
+        return NEUTRAL
+    return float(np.clip((float(value) + 1.0) / 2.0, 0.0, 1.0))
+
+
+class MuseAffectMapper:
+    """muse's valence/arousal scorer behind the five-axis contract.
+
+    Constructed with the `MuseProcessor` it runs behind, because muse scores
+    from per-window feature rows and `ProcessedFeatures.extras` is a flat dict
+    of floats that cannot carry them. The session calls `process()` then
+    `map()` on the same tick, so the rows are always the ones belonging to the
+    features passed in.
+    """
+
+    name = "muse_v1"
+
+    def __init__(self, processor):
+        self.processor = processor
+        self._cache_key: tuple | None = None
+        self._baseline: dict | None = None
+
+    def map(
+        self,
+        features: ProcessedFeatures,
+        calibrated: bool,
+        resting: RestingBaseline | None = None,
+    ) -> AffectValues:
+        baseline = self._resting_baseline(resting) if calibrated else None
+        if baseline is None:
+            # Every muse index is a z-score against the resting distribution.
+            # With no baseline there is no scale, and a moving needle would
+            # read as a working one.
+            return self._flat(calibrated, "no resting baseline")
+
+        rows = self.processor.rows
+        if not rows or not any(r["good"] for r in rows):
+            return self._flat(calibrated, "no clean windows")
+
+        score = score_epoch(rows, self.processor.autonomic_row, baseline)
+        return AffectValues(
+            axes=self._axes(score),
+            confidence=self._confidence(score),
+            calibrated=True,
+            implemented=True,
+            source=self.name,
+        )
+
+    # ------------------------------------------------------------- internals
+
+    def _axes(self, score: dict) -> dict[str, float]:
+        axes = {
+            "valence": to_unit(score["valence"]),
+            "arousal": to_unit(score["arousal"]),
+            "autonomic": NEUTRAL,
+            "direction": NEUTRAL,
+            "engagement": NEUTRAL,
+        }
+        for axis, key in UNFOLDED.items():
+            z = score.get(key)
+            if z is not None and np.isfinite(z):
+                axes[axis] = to_unit(np.tanh(float(z) / 2.0))
+        return axes
+
+    def _confidence(self, score: dict) -> dict[str, float]:
+        combined = {
+            "valence": float(score["confidence_valence"]),
+            "arousal": float(score["confidence_arousal"]),
+        }
+        out = {axis: 0.0 for axis in AXES}
+        for axis, value in combined.items():
+            out[axis] = float(np.clip(value, 0.0, 1.0))
+        for axis, key in UNFOLDED.items():
+            z = score.get(key)
+            if z is not None and np.isfinite(z):
+                out[axis] = SINGLE_INDEX_CONFIDENCE
+        # autonomic stays 0.0: nothing supplies heart or breathing yet.
+        return out
+
+    def _flat(self, calibrated: bool, why: str) -> AffectValues:
+        return AffectValues(
+            axes={axis: NEUTRAL for axis in AXES},
+            confidence={axis: 0.0 for axis in AXES},
+            calibrated=calibrated,
+            implemented=True,
+            source=f"{self.name} ({why})",
+        )
+
+    def _resting_baseline(self, resting: RestingBaseline | None) -> dict | None:
+        """muse's baseline.json equivalent, derived from the resting samples.
+
+        Cached on the recording's identity: this re-runs filtering and feature
+        extraction over the whole resting block, far too slow to repeat per
+        hop, and the key includes the timestamp so a mid-session re-baseline
+        is picked up rather than ignored.
+        """
+        if resting is None:
+            return None
+        key = (resting.wearer, resting.recorded_at, resting.n_samples)
+        if key != self._cache_key:
+            pre = preprocess_eeg(resting.eeg.T, fs=resting.fs)
+            if not any(pre["good"]):
+                return None
+            # No rr_ms or breathing: an EEG-only rest recording gives an
+            # EEG-only baseline, and the scorer skips the indices it has no
+            # statistics for.
+            self._baseline = compute_baseline(pre)
+            self._cache_key = key
+        return self._baseline

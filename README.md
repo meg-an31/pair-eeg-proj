@@ -2,10 +2,12 @@
 
     Muse 2 --BLE--> browser --wss--> server --> [processing] --> [affect] --> browser
 
-Everything in that chain exists except the two bracketed stages, which are
-deliberately empty. They ship as null objects producing correctly shaped
-output, so the transport, session lifecycle, recording and front end can all
-be built and tested before any DSP is written.
+The whole chain exists, both bracketed stages included: Welch spectra and band
+powers into five 0-1 axes measured against the wearer's own resting recording,
+plus heart rate and HRV from PPG on a slower clock. The original null objects
+are still shipped and still useful — `--null` runs them, producing correctly
+shaped output with `implemented: false`, which is what you want when debugging
+transport rather than DSP.
 
 ## Run it without a headband
 
@@ -14,8 +16,15 @@ be built and tested before any DSP is written.
     PYTHONPATH=. .venv/bin/python -m clients.synthetic --baseline   # terminal 2
 
 `clients/synthetic.py` speaks the same wire protocol the browser does, so if
-it works and the browser does not, the fault is in the browser. It can
-simulate a dropout (`--drop-at 20 --drop-for 5`) to exercise gap handling.
+it works and the browser does not, the fault is in the browser. It streams EEG
+and PPG on independent counter origins, as the hardware does. It can simulate a
+dropout (`--drop-at 20 --drop-for 5`) to exercise gap handling, and `--hr 95`
+sets the fake heart rate.
+
+Expect the axes to sit at 0.5 with zero confidence until the resting block
+finishes: 0.5 *means* "this wearer at rest", so there is nothing to report
+before one exists. `autonomic` needs a baseline of ~90 s or more, since a
+resting HRV has to accumulate first.
 
 ## Run it with a headband
 
@@ -28,15 +37,30 @@ Safari and Firefox do not implement it.
 **The Muse allows one connection at a time.** Close the Muse phone app, unpair
 the headband in system Bluetooth settings, and close other tabs holding it.
 
-## The two blank stages
+## The two stages
 
-| Stage | File | Contract |
+| Stage | Interface | Implementation |
 |---|---|---|
-| Processing | `pair_eeg/pipeline/processing.py` | `EpochWindow` → `ProcessedFeatures` |
-| Affect | `pair_eeg/pipeline/affect.py` | `ProcessedFeatures` → `AffectValues` |
+| Processing | `pipeline/processing.py` — `EpochWindow` → `ProcessedFeatures` | `pipeline/spectral.py` (+ `pipeline/pulse.py`) |
+| Affect | `pipeline/affect.py` — `ProcessedFeatures` → `AffectValues` | `pipeline/mapper.py` |
 
-Write a class satisfying the `Processor` / `AffectMapper` protocol and pass it
-to `transport.server.run()`. Nothing else changes.
+To replace either, write a class satisfying the `Processor` / `AffectMapper`
+protocol and pass it to `transport.server.run()`. Nothing else changes.
+
+The five axes, and what each is read from:
+
+| Axis | From |
+|---|---|
+| `valence` | frown-muscle amplitude, 55-110 Hz on the frontal pair (negated) |
+| `arousal` | frontal beta/alpha |
+| `direction` | frontal alpha asymmetry — withdrawal to approach |
+| `engagement` | beta/(alpha+theta), whole head |
+| `autonomic` | HRV (RMSSD) over the trailing 60 s, from PPG |
+
+Every one is a distance from the wearer's resting distribution squashed into
+0-1, so 0.5 is that wearer at rest and nothing else. Where a reading cannot be
+placed — no resting block, a detached electrode, too few heartbeats — the axis
+stays at 0.5 and its confidence goes to 0 rather than the needle moving.
 
 Output shapes, fixed by the hardware:
 
@@ -115,8 +139,11 @@ with their original counters, so a network dropout becomes a marked gap.
       transport/server.py     websocket hub, session fan-out
       pipeline/ringbuffer.py  counter-indexed, gap-aware
       pipeline/quality.py     amplitude and contact gating
-      pipeline/processing.py  BLANK SEAM
-      pipeline/affect.py      BLANK SEAM
+      pipeline/processing.py  seam 1 interface
+      pipeline/spectral.py    seam 1: Welch, bands, EEG features
+      pipeline/pulse.py       heart rate + HRV from PPG (slow lane)
+      pipeline/affect.py      seam 2 interface
+      pipeline/mapper.py      seam 2: features -> 0-1 axes vs resting
       pipeline/session.py     state machine + epoch loop
       pipeline/rawlog.py      append-only capture
       pipeline/store.py       session dirs + sqlite index

@@ -2,9 +2,11 @@
 
     python -m pair_eeg [--host H] [--port P] [--sessions DIR]
 
-Both processing stages are null by default — the pipe runs end to end and
-reports correctly shaped zeros. See pipeline/processing.py and
-pipeline/affect.py for what goes in them.
+Both stages are real by default: Welch spectra and band powers
+(pipeline/spectral.py) into distance-from-resting axes (pipeline/mapper.py).
+Pass --null to run the placeholder stages instead, which report correctly
+shaped zeros and are the right choice when debugging transport rather than
+DSP.
 """
 
 from __future__ import annotations
@@ -15,6 +17,8 @@ import logging
 from dataclasses import replace
 
 from .config import DEFAULT
+from .pipeline.affect import MuseAffectMapper
+from .pipeline.processing import MuseProcessor
 from .transport.server import run
 
 
@@ -26,6 +30,8 @@ def main() -> None:
     p.add_argument("--window", type=float, default=DEFAULT.window_s)
     p.add_argument("--hop", type=float, default=DEFAULT.hop_s)
     p.add_argument("--baseline", type=float, default=DEFAULT.baseline_s)
+    p.add_argument("--null", action="store_true",
+                   help="run the placeholder stages instead of the real ones")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -55,8 +61,13 @@ def main() -> None:
         baseline_s=args.baseline,
     )
 
+    processor = affect = None
+    if not args.null:
+        processor = MuseProcessor()
+        affect = MuseAffectMapper(processor)
+
     try:
-        asyncio.run(run(cfg))
+        asyncio.run(run(cfg, processor=processor, affect=affect))
     except KeyboardInterrupt:
         pass
 

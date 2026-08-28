@@ -97,10 +97,12 @@ async def test_state_goes_stale_when_data_stops():
 
 # --- co-window ------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=
-    "BUG: _co_window scales the EEG counter directly, assuming all streams share a counter origin (session.py:251-257).")
-def test_co_window_assumes_shared_counter_origins():
-    """PPG/IMU counters are independent of the EEG counter on real hardware."""
+def test_co_window_translates_through_stream_origins():
+    """PPG/IMU counters are independent of the EEG counter on real hardware.
+
+    Was xfail: _co_window scaled the EEG counter directly and handed back an
+    all-NaN array. Now translated through each buffer's own origin.
+    """
     s, _ = mk()
     s.ingest(eeg_frame(100_000, 1024))
     rng = np.random.default_rng(0)
@@ -208,3 +210,32 @@ def test_freqs_are_not_shared_between_results():
     a, b = make(), make()
     a.freqs[0] = 999.0
     assert b.freqs[0] == 0.0
+
+
+# --- baseline statistics over optional features ---------------------------
+
+def test_baseline_means_divide_by_the_ticks_that_reported_the_feature():
+    """Features are optional: a stage omits one rather than inventing a value
+    when an electrode is detached, and HRV appears only once enough beats have
+    accumulated. Dividing by the tick count instead would scale a
+    rarely-reported feature towards zero, and everything normalised against it
+    would be wrong in a direction nobody thinks to check."""
+    b = Baseline()
+    b.observe({"always": 10.0, "sometimes": 100.0})
+    for _ in range(9):
+        b.observe({"always": 10.0})
+    b.freeze()
+    assert b.mean["always"] == pytest.approx(10.0)
+    assert b.mean["sometimes"] == pytest.approx(100.0)
+    assert b.to_dict()["n_by_key"] == {"always": 10, "sometimes": 1}
+
+
+def test_baseline_sd_also_uses_the_per_feature_count():
+    b = Baseline()
+    for value in (8.0, 12.0):
+        b.observe({"rare": value})
+    for _ in range(20):
+        b.observe({"common": 1.0})
+    b.freeze()
+    assert b.mean["rare"] == pytest.approx(10.0)
+    assert b.sd["rare"] == pytest.approx(2.0)

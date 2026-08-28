@@ -174,3 +174,41 @@ def test_processor_and_mapper_accept_resting():
     features = NullProcessor().process(epoch, resting=resting)
     values = NullAffectMapper().map(features, calibrated=True, resting=resting)
     assert set(values.axes)
+
+
+# --- a short block must not replace a good one ----------------------------
+
+def test_a_too_short_block_is_refused_and_leaves_the_stored_one_alone(tmp_path):
+    """A baseline that ends early still builds a technically valid block. If
+    that gets saved it replaces a good recording with one that cannot support a
+    single statistic, and every axis afterwards reads 0.5 with no confidence —
+    indistinguishable from an unimplemented stage."""
+    import asyncio
+
+    from pair_eeg.config import EEG, Config
+    from pair_eeg.pipeline.session import MIN_RESTING_S, Session
+
+    store = RestingStore(tmp_path)
+    good = RestingBaseline(
+        wearer="w", recorded_at=time.time(), fs=EEG.rate_hz,
+        channels=EEG.channels,
+        eeg=np.zeros((int(EEG.rate_hz * 60), EEG.n_channels), dtype=np.float32),
+    )
+    store.save(good)
+
+    async def emit(_):
+        pass
+
+    s = Session("s", "w", Config(sessions_dir=str(tmp_path)), emit,
+                resting_store=store)
+    assert s.resting is not None and s.resting.duration_s == pytest.approx(60.0)
+
+    # one second of "rest" — far below the floor
+    s._collector.observe(0, np.zeros((256, EEG.n_channels), dtype=np.float32), 256)
+    s.baseline.observe({"x": 1.0})
+    s.baseline.freeze()
+    s._finish_resting()
+
+    assert s.resting.duration_s == pytest.approx(60.0), "short block was adopted"
+    assert store.load("w").duration_s == pytest.approx(60.0), "stored block overwritten"
+    assert MIN_RESTING_S > 1.0

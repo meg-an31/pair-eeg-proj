@@ -35,8 +35,19 @@ STREAMS_BY_ID: dict[int, StreamSpec] = {s.stream_id: s for s in STREAMS.values()
 @dataclass(frozen=True)
 class Config:
     # --- epoching -------------------------------------------------------
-    window_s: float = 4.0
-    hop_s: float = 1.0
+    # muse's native geometry: it scores a 30 s epoch, stepping 5 s, and cuts
+    # that epoch into 29 overlapping 2 s windows internally. Two of its gates
+    # depend on the length — the tonic/phasic muscle split needs at least 5
+    # windows, and the heart features at least 20 beats — so a shorter epoch
+    # does not degrade the score gracefully, it silently drops voters.
+    #
+    # Note what the epoch-level quality gate does and does not do at this
+    # length: a 30 s window almost always contains a blink, so the frontal
+    # channels get flagged `noisy` while TP9/TP10 keep the epoch accepted.
+    # That is correct here — rejecting artifacts at 2 s granularity is muse's
+    # job, and it does it per window.
+    window_s: float = 30.0
+    hop_s: float = 5.0
 
     # --- session lifecycle ----------------------------------------------
     baseline_s: float = 120.0
@@ -53,7 +64,10 @@ class Config:
     hrv_refresh_s: float = 5.0
 
     # --- smoothing ---------------------------------------------------------
-    smoothing_windows: float = 5.0
+    # 1.0 = pass-through (alpha of 1.0). muse does not smooth: a 30 s epoch is
+    # already a heavy average, and an EMA over 5 of them would add ~25 s of
+    # lag on top of the 15 s the window centroid already costs.
+    smoothing_windows: float = 1.0
 
     # --- buffers ------------------------------------------------------------
     buffer_s: float = 180.0

@@ -70,6 +70,17 @@ class RingBuffer:
         return self._head
 
     @property
+    def origin(self) -> int | None:
+        """First counter ever written, or None while empty.
+
+        Exposed because streams do not share a counter origin: each Muse
+        characteristic has its own 16-bit hardware counter, so aligning two
+        streams in time means translating through both origins rather than
+        scaling one counter by a rate ratio. See Session._co_window.
+        """
+        return self._origin
+
+    @property
     def tail(self) -> int:
         """Oldest counter still retained."""
         return max(self._head - self.capacity, self._origin or 0)

@@ -16,7 +16,12 @@ from websockets.asyncio.server import serve
 
 @pytest.fixture
 async def server(tmp_path):
-    cfg = replace(DEFAULT, sessions_dir=str(tmp_path), port=0, baseline_s=2.0)
+    # A short window and hop, pinned here rather than inherited: these are
+    # transport tests, and the production geometry is a 30 s epoch stepping
+    # 5 s, so a test that feeds a few seconds and waits for an estimate would
+    # simply time out on a change that has nothing to do with what it checks.
+    cfg = replace(DEFAULT, sessions_dir=str(tmp_path), port=0, baseline_s=2.0,
+                  window_s=4.0, hop_s=1.0)
     hub = Hub(cfg)
     async with serve(lambda ws: handle(ws, hub), "127.0.0.1", 0) as srv:
         port = srv.sockets[0].getsockname()[1]

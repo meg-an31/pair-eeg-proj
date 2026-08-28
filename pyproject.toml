@@ -3,7 +3,7 @@ name = "pair-eeg"
 version = "0.1.0"
 description = "Streaming infrastructure for Muse EEG affect estimation"
 requires-python = ">=3.11"
-dependencies = ["websockets>=12.0", "numpy>=1.26"]
+dependencies = ["websockets>=12.0", "numpy>=1.26", "scipy>=1.11"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]

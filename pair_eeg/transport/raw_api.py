@@ -276,6 +276,8 @@ def main() -> None:
     p.add_argument("--window", type=float, default=DEFAULT.window_s)
     p.add_argument("--hop", type=float, default=DEFAULT.hop_s)
     p.add_argument("--baseline", type=float, default=DEFAULT.baseline_s)
+    p.add_argument("--null", action="store_true",
+                   help="run the placeholder stages instead of the real ones")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -298,8 +300,16 @@ def main() -> None:
         hop_s=args.hop,
         baseline_s=args.baseline,
     )
+    processor = affect = None
+    if not args.null:
+        from ..pipeline.affect import MuseAffectMapper
+        from ..pipeline.processing import MuseProcessor
+
+        processor = MuseProcessor()
+        affect = MuseAffectMapper(processor)
+
     try:
-        asyncio.run(run(cfg))
+        asyncio.run(run(cfg, processor=processor, affect=affect))
     except KeyboardInterrupt:
         pass
 

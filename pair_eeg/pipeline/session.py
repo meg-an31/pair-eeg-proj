@@ -45,6 +45,14 @@ from .ringbuffer import RingBuffer
 
 log = logging.getLogger("pair_eeg.session")
 
+# Shortest resting recording worth keeping. One full epoch, because the
+# baseline's epoch-level indices (the tonic/phasic muscle split) are computed
+# over sliding 30 s spans: a shorter block yields none of them, and valence
+# then falls back to frontal alpha asymmetry alone. Two minutes is what should
+# actually be recorded; this is the floor below which a block is refused
+# rather than allowed to replace a good one.
+MIN_RESTING_S = 30.0
+
 
 class SessionState(str, Enum):
     CONNECTING = "connecting"
@@ -68,6 +76,7 @@ class Baseline:
     n: int = 0
     _sum: dict[str, float] = field(default_factory=dict)
     _sumsq: dict[str, float] = field(default_factory=dict)
+    _n: dict[str, int] = field(default_factory=dict)
     frozen: bool = False
     mean: dict[str, float] = field(default_factory=dict)
     sd: dict[str, float] = field(default_factory=dict)
@@ -78,6 +87,7 @@ class Baseline:
         for key, value in features.items():
             self._sum[key] = self._sum.get(key, 0.0) + value
             self._sumsq[key] = self._sumsq.get(key, 0.0) + value * value
+            self._n[key] = self._n.get(key, 0) + 1
         self.n += 1
 
     def freeze(self) -> None:
@@ -86,21 +96,33 @@ class Baseline:
         # normalised against nothing.
         if self.frozen or self.n == 0 or not self._sum:
             return
+        # Divide each feature by the number of ticks that REPORTED IT, not by
+        # the tick count. Features are optional by design — a stage omits one
+        # rather than inventing a value for it when an electrode is detached,
+        # and HRV only exists once enough beats have accumulated — so a key
+        # present in 3 of 60 ticks would otherwise come out at a twentieth of
+        # its real value, and every axis normalised against it would be
+        # confidently wrong in a direction nobody would think to check.
         for key, total in self._sum.items():
-            mean = total / self.n
-            var = max(self._sumsq[key] / self.n - mean * mean, 0.0)
+            count = self._n.get(key, 0)
+            if count == 0:
+                continue
+            mean = total / count
+            var = max(self._sumsq[key] / count - mean * mean, 0.0)
             self.mean[key] = mean
             self.sd[key] = float(np.sqrt(var)) or 1.0
         self.frozen = True
 
     def to_dict(self) -> dict:
-        return {"n": self.n, "frozen": self.frozen, "mean": self.mean, "sd": self.sd}
+        return {"n": self.n, "frozen": self.frozen, "mean": self.mean,
+                "sd": self.sd, "n_by_key": dict(self._n)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Baseline":
         b = cls(n=int(d.get("n", 0)), frozen=bool(d.get("frozen", False)))
         b.mean = dict(d.get("mean", {}))
         b.sd = dict(d.get("sd", {}))
+        b._n = {k: int(v) for k, v in d.get("n_by_key", {}).items()}
         return b
 
 
@@ -378,16 +400,38 @@ class Session:
         await self.emit(self._payload(verdict, features, values, smoothed))
 
     def _co_window(self, stream, eeg_start: int, eeg_n: int) -> np.ndarray | None:
-        """The same span of wall time on a stream with a different rate."""
+        """The same span of wall time on a stream with a different rate.
+
+        Counters are per-stream, not global: every Muse characteristic carries
+        its own 16-bit hardware counter, and the browser decodes each one
+        independently. So an EEG counter of 100000 and a PPG counter of 0 can
+        be simultaneous, and scaling the EEG counter by the rate ratio — which
+        this used to do — reads a position that stream has never reached. The
+        symptom is not a crash but an all-NaN array, so it looks like a sensor
+        that is not connected.
+
+        Translating through both origins fixes it, on the assumption that the
+        two streams STARTED together, which is what the capture client
+        guarantees by subscribing to everything before it sends anything. That
+        is a weaker assumption than a shared counter but not a free one.
+        It drifts if a stream reconnects mid-session and restarts its counter,
+        which is why the offset is recomputed from the live origins on every
+        call rather than cached. It also drifts slowly whenever a stream's true
+        rate differs from its declared one, since the translation scales by the
+        ratio of the DECLARED rates: an 0.1 Hz error on PPG walks the window
+        off by a sample every ten seconds, so it takes roughly forty minutes to
+        exceed a 4 s window and start reading as an absent sensor. Worth
+        knowing before blaming the electrodes on a long recording.
+        """
         buf = self.buffers[stream.name]
-        if buf.empty:
+        eeg_buf = self.buffers[EEG.name]
+        if buf.empty or eeg_buf.empty:
             return None
-        # NOTE: assumes this stream shares a counter origin with EEG. That
-        # holds for the synthetic client and for BrainFlow, but the browser
-        # decodes a separate counter per characteristic, so PPG and IMU need
-        # time-based alignment before they can be trusted here.
+        eeg_origin = eeg_buf.origin or 0
+        origin = buf.origin or 0
         ratio = stream.rate_hz / EEG.rate_hz
-        window = buf.read(int(eeg_start * ratio), max(1, int(eeg_n * ratio)))
+        start = origin + int(round((eeg_start - eeg_origin) * ratio))
+        window = buf.read(start, max(1, int(eeg_n * ratio)))
         if window.n_missing == window.n_samples:
             return None          # entirely absent, not merely gappy
         return window.samples
@@ -422,11 +466,32 @@ class Session:
                 self._transition(SessionState.LIVE)
 
     def _finish_resting(self) -> None:
-        """Build the resting block and cache it for next time."""
+        """Build the resting block and cache it for next time.
+
+        A block too short to describe a distribution is refused rather than
+        adopted, and in particular never overwrites a good stored one. Without
+        this, a baseline block that ends early — the wall-clock timing bug, a
+        misconfigured `baseline_s`, a wearer who pulls the headband off — still
+        produces a technically valid RestingBaseline of a second or two, and
+        saving it replaces a perfectly good recording with one that cannot
+        support a single statistic. The failure is silent and permanent: every
+        axis afterwards reports 0.5 with zero confidence, which looks exactly
+        like a stage that was never implemented.
+        """
         built = self._collector.build(self.wearer)
         if built is None:
             log.warning(
                 "session %s: baseline block ended with no accepted epochs", self.id
+            )
+            return
+        if built.duration_s < MIN_RESTING_S:
+            log.warning(
+                "session %s: baseline block collected only %.1fs of accepted data "
+                "(need %.0fs); keeping the %s resting block",
+                self.id,
+                built.duration_s,
+                MIN_RESTING_S,
+                "existing" if self.resting is not None else "absent",
             )
             return
         built = replace(built, features=dict(self.baseline.mean))
