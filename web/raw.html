@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raw stream inspector</title>
+<style>
+  :root{
+    --bg:#0e1015; --panel:#161921; --line:#282d38;
+    --ink:#e8eaef; --dim:#8d94a4; --accent:#8f9cf1;
+    --ok:#4fbf98; --warn:#dd9a5c; --bad:#e2727c;
+  }
+  @media (prefers-color-scheme:light){
+    :root:not([data-theme="dark"]){
+      --bg:#eceef2; --panel:#fff; --line:#d4d8e1;
+      --ink:#171a21; --dim:#6e7585; --accent:#3f4fb6;
+      --ok:#1c7355; --warn:#a2571f; --bad:#a52e39;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:13px;line-height:1.5}
+  header{padding:14px 20px;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  h1{font-size:14px;margin:0;font-weight:600}
+  main{padding:18px;display:grid;gap:14px;max-width:1050px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:14px 16px}
+  .panel h2{font-size:10px;text-transform:uppercase;letter-spacing:.12em;
+    color:var(--dim);margin:0 0 12px;font-weight:500;
+    display:flex;justify-content:space-between;align-items:center}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;
+    border-radius:99px;border:1px solid var(--line);font-size:11px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--dim)}
+  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+  canvas{width:100%;height:260px;display:block}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.1em;
+    color:var(--dim);font-weight:500;padding:5px 8px 5px 0}
+  td{padding:4px 8px 4px 0;border-top:1px solid var(--line)}
+  button,select{font:inherit;font-size:12px;background:var(--bg);color:var(--ink);
+    border:1px solid var(--line);border-radius:3px;padding:5px 10px;cursor:pointer}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  pre{margin:0;font-size:11px;color:var(--dim);max-height:220px;overflow:auto;
+    white-space:pre-wrap;word-break:break-all}
+  .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .hint{color:var(--dim);font-size:11px;margin:10px 0 0}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Raw stream inspector</h1>
+  <span class="pill"><span class="dot" id="dot"></span><span id="status">idle</span></span>
+  <span class="pill" id="session">—</span>
+  <span style="flex:1"></span>
+  <a href="./view.html" style="color:var(--accent);font-size:12px">viewer →</a>
+</header>
+
+<main>
+  <div class="panel">
+    <h2>Waveform <span id="scaleLabel" style="color:var(--dim)"></span></h2>
+    <div class="controls">
+      <label>stream
+        <select id="stream">
+          <option value="eeg">eeg (4ch, 256 Hz)</option>
+          <option value="ppg">ppg (3ch, 64 Hz)</option>
+          <option value="imu">imu (6ch, 52 Hz)</option>
+        </select>
+      </label>
+      <label>samples
+        <select id="n">
+          <option value="256">256 (1 s)</option>
+          <option value="512" selected>512 (2 s)</option>
+          <option value="1280">1280 (5 s)</option>
+          <option value="2560">2560 (10 s)</option>
+        </select>
+      </label>
+      <label>every
+        <select id="interval">
+          <option value="250">250 ms</option>
+          <option value="500" selected>500 ms</option>
+          <option value="1000">1 s</option>
+          <option value="0">paused</option>
+        </select>
+      </label>
+      <button id="csv">download csv</button>
+    </div>
+    <canvas id="scope"></canvas>
+    <p class="hint" id="fillHint"></p>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Transport</h2>
+      <table>
+        <tr><th>State</th><td id="state">—</td></tr>
+        <tr><th>Frames in</th><td id="frames">—</td></tr>
+        <tr><th>Discontinuities</th><td id="gaps">—</td></tr>
+        <tr><th>Last sample</th><td id="age">—</td></tr>
+        <tr><th>Buffered</th><td id="held">—</td></tr>
+        <tr><th>Viewers</th><td id="viewers">—</td></tr>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2>Per-channel RMS <span style="color:var(--dim)">last 1 s</span></h2>
+      <table>
+        <thead><tr><th>Ch</th><th>µV</th><th></th></tr></thead>
+        <tbody id="rms"><tr><td colspan="3" style="color:var(--dim)">—</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2>Newest sample</h2>
+      <pre id="newest">—</pre>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const API = params.get("api") || "";
+
+const scope = $("scope"), ctx = scope.getContext("2d");
+let latest = null, timer = null;
+
+function resize(){
+  const dpr = devicePixelRatio || 1;
+  scope.width = scope.clientWidth * dpr;
+  scope.height = scope.clientHeight * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  draw();
+}
+addEventListener("resize", resize);
+
+function setDot(cls, text){
+  $("dot").className = "dot" + (cls ? " "+cls : "");
+  $("status").textContent = text;
+}
+
+function draw(){
+  const w = scope.clientWidth, h = scope.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  if (!latest || !latest.samples || !latest.samples.length){
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue("--dim");
+    ctx.font = "12px ui-monospace, monospace";
+    ctx.fillText("no samples", 10, 20);
+    return;
+  }
+
+  const rows = latest.samples, nCh = latest.channels.length;
+  const laneH = h / nCh;
+  const css = getComputedStyle(document.documentElement);
+  const accent = css.getPropertyValue("--accent").trim();
+  const dim = css.getPropertyValue("--dim").trim();
+  const bad = css.getPropertyValue("--bad").trim();
+
+  for (let c = 0; c < nCh; c++){
+    let peak = 1e-9, seen = 0;
+    for (const r of rows){ const v = r[c]; if (v != null){ seen++; peak = Math.max(peak, Math.abs(v)); } }
+    if (latest.stream === "eeg") peak = Math.min(Math.max(peak, 10), 500);
+
+    const mid = laneH*c + laneH/2;
+    ctx.strokeStyle = dim; ctx.globalAlpha = .35; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(w, mid); ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Draw only across runs of real samples; a hole is a break in the line,
+    // never a straight segment bridging it.
+    ctx.strokeStyle = accent; ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < rows.length; i++){
+      const v = rows[i][c];
+      const x = (i/(rows.length-1||1))*w;
+      if (v == null){ pen = false; continue; }
+      const y = mid - (v/peak)*(laneH*0.40);
+      if (!pen){ ctx.moveTo(x,y); pen = true; } else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = dim; ctx.font = "10px ui-monospace, monospace";
+    ctx.fillText(`${latest.channels[c]}  ±${peak.toFixed(0)}`, 6, laneH*c + 13);
+    if (seen < rows.length){
+      ctx.fillStyle = bad;
+      ctx.fillText(`${rows.length-seen} missing`, w-86, laneH*c + 13);
+    }
+  }
+}
+
+async function tick(){
+  const stream = $("stream").value, n = $("n").value;
+  try {
+    const [rawRes, statRes] = await Promise.all([
+      fetch(`${API}/raw/${stream}?n=${n}`, {cache:"no-store"}),
+      fetch(`${API}/raw/stats`, {cache:"no-store"}),
+    ]);
+    const raw = await rawRes.json(), stats = await statRes.json();
+
+    if (raw.type === "idle"){
+      setDot("warn","nothing streaming"); latest = null; draw();
+      $("session").textContent = "—";
+      $("state").textContent = "idle";
+      return;
+    }
+
+    latest = raw;
+    setDot("ok", `${raw.n} samples @ ${raw.fs} Hz`);
+    $("session").textContent = raw.session || "—";
+    $("scaleLabel").textContent = raw.stream === "eeg" ? "microvolts" : "raw counts";
+    $("fillHint").textContent =
+      `counter ${raw.counter} · fill ${(raw.fill*100).toFixed(1)}%` +
+      (raw.missing ? ` · ${raw.missing} samples never arrived` : " · no holes");
+
+    const last = raw.samples[raw.samples.length-1];
+    $("newest").textContent = JSON.stringify(
+      Object.fromEntries(raw.channels.map((c,i)=>[c, last ? last[i] : null])), null, 1);
+
+    if (stats.type === "raw_stats"){
+      $("state").textContent = stats.state;
+      $("frames").textContent = stats.frames_in ?? "—";
+      $("gaps").textContent = stats.discontinuities ?? "—";
+      $("age").textContent = stats.last_ingest_age_s != null
+        ? stats.last_ingest_age_s.toFixed(1)+"s ago" : "—";
+      $("held").textContent = stats.streams?.eeg
+        ? stats.streams.eeg.seconds_held.toFixed(1)+"s" : "—";
+      $("viewers").textContent = stats.viewers ?? "—";
+      $("rms").innerHTML = Object.entries(stats.rms_uv_1s || {}).map(([ch,v])=>{
+        const cls = v == null ? "" : v < 2 ? "bad" : v > 80 ? "warn" : "ok";
+        return `<tr><td>${ch}</td><td>${v==null?"—":v.toFixed(1)}</td>
+                <td><span class="dot ${cls}"></span></td></tr>`;
+      }).join("") || `<tr><td colspan="3" style="color:var(--dim)">—</td></tr>`;
+    }
+    draw();
+  } catch (err) {
+    setDot("bad", "fetch failed");
+  }
+}
+
+function schedule(){
+  if (timer) clearInterval(timer);
+  const ms = parseInt($("interval").value, 10);
+  if (ms > 0){ tick(); timer = setInterval(tick, ms); }
+}
+$("interval").addEventListener("change", schedule);
+$("stream").addEventListener("change", tick);
+$("n").addEventListener("change", tick);
+$("csv").addEventListener("click", () => {
+  location.href = `${API}/raw/eeg.csv?n=${Math.max(2048, +$("n").value)}`;
+});
+
+resize();
+schedule();
+</script>
+</body>
+</html>

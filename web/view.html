@@ -48,6 +48,7 @@
     color:var(--dim);font-weight:500;padding:5px 8px 5px 0}
   td{padding:4px 8px 4px 0;border-top:1px solid var(--line)}
   .idle{color:var(--dim);text-align:center;padding:28px 0}
+  canvas{width:100%;height:170px;display:block}
 </style>
 </head>
 <body>
@@ -65,6 +66,14 @@
     <h2>Axes — 0 to 1, 0.5 is the wearer's baseline</h2>
     <div class="axes" id="axes"></div>
     <p class="note" id="note"></p>
+  </div>
+
+  <div class="panel">
+    <h2>Raw signal <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">
+      — is anything actually arriving?</span></h2>
+    <canvas id="rawScope"></canvas>
+    <p class="note" id="rawHint">waiting…</p>
+    <p class="note"><a href="./raw.html" style="color:var(--accent)">full inspector →</a></p>
   </div>
 
   <div class="panel">
@@ -187,6 +196,79 @@ function connect(){
     }
   };
 }
+
+// ---- raw scope ---------------------------------------------------------
+// Polls the inspection API, which reads the ring buffer directly. Nothing on
+// this path touches the analysis stages, so a flat trace here means the
+// problem is upstream of the pipeline rather than in it.
+const rawCanvas = $("rawScope"), rawCtx = rawCanvas.getContext("2d");
+let rawData = null;
+
+function sizeRaw(){
+  const dpr = devicePixelRatio || 1;
+  rawCanvas.width = rawCanvas.clientWidth * dpr;
+  rawCanvas.height = rawCanvas.clientHeight * dpr;
+  rawCtx.setTransform(dpr,0,0,dpr,0,0);
+  drawRaw();
+}
+addEventListener("resize", sizeRaw);
+
+function drawRaw(){
+  const w = rawCanvas.clientWidth, h = rawCanvas.clientHeight;
+  rawCtx.clearRect(0,0,w,h);
+  const css = getComputedStyle(document.documentElement);
+  if (!rawData || !rawData.samples?.length){
+    rawCtx.fillStyle = css.getPropertyValue("--dim").trim();
+    rawCtx.font = "12px ui-monospace, monospace";
+    rawCtx.fillText("no samples", 10, 20);
+    return;
+  }
+  const rows = rawData.samples, nCh = rawData.channels.length, laneH = h/nCh;
+  const accent = css.getPropertyValue("--accent").trim();
+  const dim = css.getPropertyValue("--dim").trim();
+
+  for (let c=0;c<nCh;c++){
+    let peak = 1e-9;
+    for (const r of rows){ const v=r[c]; if (v!=null) peak = Math.max(peak, Math.abs(v)); }
+    peak = Math.min(Math.max(peak,10),500);
+    const mid = laneH*c + laneH/2;
+    rawCtx.strokeStyle = accent; rawCtx.lineWidth = 1;
+    rawCtx.beginPath();
+    let pen = false;
+    for (let i=0;i<rows.length;i++){
+      const v = rows[i][c];
+      const x = (i/(rows.length-1||1))*w;
+      if (v == null){ pen = false; continue; }   // hole: break the line
+      const y = mid - (v/peak)*(laneH*0.38);
+      if (!pen){ rawCtx.moveTo(x,y); pen = true; } else rawCtx.lineTo(x,y);
+    }
+    rawCtx.stroke();
+    rawCtx.fillStyle = dim; rawCtx.font = "9.5px ui-monospace, monospace";
+    rawCtx.fillText(`${rawData.channels[c]} ±${peak.toFixed(0)}µV`, 5, laneH*c+11);
+  }
+}
+
+async function pollRaw(){
+  try {
+    const res = await fetch("/raw/eeg?n=768", {cache:"no-store"});
+    const data = await res.json();
+    if (data.type === "idle"){
+      rawData = null;
+      $("rawHint").textContent = "nothing streaming";
+    } else {
+      rawData = data;
+      $("rawHint").textContent =
+        `${data.n} samples @ ${data.fs} Hz · fill ${(data.fill*100).toFixed(1)}%`
+        + (data.missing ? ` · ${data.missing} missing` : "");
+    }
+    drawRaw();
+  } catch {
+    $("rawHint").textContent = "inspection API unavailable";
+  }
+  setTimeout(pollRaw, 500);
+}
+sizeRaw();
+pollRaw();
 
 setInterval(() => {
   $("updated").textContent = lastUpdate
