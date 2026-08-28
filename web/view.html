@@ -86,6 +86,11 @@ const params = new URLSearchParams(location.search);
 const WS_URL = params.get("server")
   || (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
 
+// ?poll=1  -> poll GET /latest every second instead of holding a socket.
+// Same numbers either way; the server computes on its own clock regardless.
+const POLL_S = params.has("poll") ? Math.max(0.2, parseFloat(params.get("poll")) || 1) : 0;
+const LATEST_URL = params.get("latest") || "/latest";
+
 const els = {};
 for (const name of AXES){
   const row = document.createElement("div");
@@ -188,7 +193,48 @@ setInterval(() => {
     ? Math.round((Date.now()-lastUpdate)/1000) + "s ago" : "—";
 }, 1000);
 
-connect();
+function applyAxes(msg){
+  if (!msg.axes) return;
+  for (const [name, value] of Object.entries(msg.axes)){
+    const el = els[name]; if (!el) continue;
+    el.fill.style.width = (value*100).toFixed(1) + "%";
+    el.val.textContent = value.toFixed(2);
+  }
+  lastUpdate = Date.now();
+}
+
+async function poll(){
+  try {
+    const res = await fetch(LATEST_URL, { cache: "no-store" });
+    const msg = await res.json();
+    setDot("ok", `polling every ${POLL_S}s`);
+
+    if (msg.type === "idle"){
+      $("statePill").textContent = "state: idle";
+      $("note").textContent = "No headband streaming right now.";
+      $("session").textContent = "none";
+    } else if (msg.type === "warming_up"){
+      $("statePill").textContent = "state: " + msg.state;
+      $("session").textContent = msg.session;
+      $("note").textContent = "Waiting for the first full window…";
+    } else {
+      $("session").textContent = msg.session ?? "—";
+      $("statePill").textContent = "state: " + msg.state;
+      if (msg.accept_rate != null) $("accept").textContent = (msg.accept_rate*100).toFixed(0) + "%";
+      $("calibrated").textContent = msg.calibrated ? "yes" : "no";
+      $("note").className = msg.implemented ? "note" : "note warn";
+      $("note").textContent = msg.implemented
+        ? "" : "Affect stage not implemented — axes pinned to 0.5.";
+      applyAxes(msg);
+    }
+  } catch {
+    setDot("bad", "poll failed");
+  }
+  setTimeout(poll, POLL_S * 1000);
+}
+
+if (POLL_S) { $("viewers").textContent = "polling"; poll(); }
+else connect();
 </script>
 </body>
 </html>

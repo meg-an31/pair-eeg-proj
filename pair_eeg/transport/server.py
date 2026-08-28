@@ -29,6 +29,7 @@ from ..config import Config
 from ..pipeline.affect import AffectMapper
 from ..pipeline.processing import Processor
 from ..pipeline.rawlog import RawLog
+from ..pipeline.resting import RestingStore
 from ..pipeline.session import Session
 from ..pipeline.store import Store, new_session_id
 from .protocol import (
@@ -58,6 +59,7 @@ class Hub:
         self.processor = processor
         self.affect = affect
         self.store = Store(config.sessions_dir)
+        self.resting_store = RestingStore(config.sessions_dir)
 
         self.session: Session | None = None
         self.capture_ws: ServerConnection | None = None
@@ -104,6 +106,7 @@ class Hub:
             affect=self.affect,
             raw_log=raw_log,
             session_dir=session_dir,
+            resting_store=self.resting_store,
         )
         self.session = session
         await session.start()
@@ -174,6 +177,27 @@ class Hub:
                 if ws is self.capture_ws:
                     log.warning("capture client send failed: %s", result)
 
+    def latest(self, full: bool = False) -> dict:
+        """Newest computed result, for polling.
+
+        Reads a slot the compute loop overwrites; it never triggers work and
+        never blocks on it, so the poll rate and the compute rate are free to
+        differ. A reader slower than 1 Hz simply misses intermediate values,
+        which is the correct failure — the alternative, queueing results per
+        reader, drifts further behind the longer it runs.
+        """
+        session = self.session
+        if session is None:
+            return {"type": "idle", "capture_held": False, "session": None}
+        payload = session.latest if full else session.latest_axes
+        if payload is None:
+            return {
+                "type": "warming_up",
+                "session": session.id,
+                "state": session.state.value,
+            }
+        return payload
+
     def status(self) -> dict:
         """What a client is told on arrival when there is no live session."""
         return {
@@ -188,6 +212,9 @@ class Hub:
                 "processing": getattr(self.processor, "name", "null_v0"),
                 "affect": getattr(self.affect, "name", "null_v0"),
             },
+            "resting_available": self.session.resting is not None
+            if self.session
+            else None,
         }
 
 
@@ -279,6 +306,20 @@ async def handle(ws: ServerConnection, hub: Hub) -> None:
                 session.skip_baseline()
                 await ws.send(encode_payload(session.snapshot()))
 
+            elif kind == "use_saved_resting":
+                if session.use_saved_resting():
+                    await ws.send(encode_payload(session.snapshot()))
+                else:
+                    await ws.send(
+                        encode_message(
+                            "error",
+                            detail=(
+                                "No saved resting block for this wearer. Record "
+                                "one by staring at a wall for two minutes."
+                            ),
+                        )
+                    )
+
             elif kind == "marker":
                 if session.raw_log is not None:
                     session.raw_log.append_event(
@@ -296,6 +337,53 @@ async def handle(ws: ServerConnection, hub: Hub) -> None:
             await hub.release_capture(ws)
 
 
+ROUTES = {
+    "/latest": lambda hub: hub.latest(full=False),
+    "/latest/full": lambda hub: hub.latest(full=True),
+    "/status": lambda hub: hub.status(),
+    "/health": lambda hub: {"ok": True},
+}
+
+
+def http_handler(hub: Hub):
+    """Serve the polling endpoints on the websocket's own port.
+
+    Returning None lets the request continue as a websocket handshake, so
+    /ws and /latest coexist without a second server or a second port.
+    """
+
+    def process_request(connection, request):
+        path = request.path.split("?", 1)[0].rstrip("/") or "/"
+        route = ROUTES.get(path)
+        if route is None:
+            return None                      # not ours; try websocket upgrade
+
+        body = encode_payload(_typed(route(hub))).encode() + b"\n"
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(body))),
+            # Polled every second by pages served from another origin.
+            ("Access-Control-Allow-Origin", "*"),
+            ("Cache-Control", "no-store"),
+        ]
+        return connection.respond_with_body(200, headers, body) if hasattr(
+            connection, "respond_with_body"
+        ) else _plain_response(connection, body, headers)
+
+    return process_request
+
+
+def _typed(payload: dict) -> dict:
+    return payload if "type" in payload else {"type": "result", **payload}
+
+
+def _plain_response(connection, body: bytes, headers: list[tuple[str, str]]):
+    from websockets.http11 import Response
+    from websockets.datastructures import Headers
+
+    return Response(200, "OK", Headers(headers), body)
+
+
 async def run(
     config: Config,
     processor: Processor | None = None,
@@ -309,9 +397,11 @@ async def run(
         max_size=2**20,
         ping_interval=20,
         ping_timeout=20,
+        process_request=http_handler(hub),
     ):
         log.info("listening on ws://%s:%d", config.host, config.port)
         log.info("one capture client, unlimited viewers")
+        log.info("polling: GET /latest  /latest/full  /status  /health")
         log.info(
             "processing=%s  affect=%s",
             getattr(processor, "name", "null_v0"),

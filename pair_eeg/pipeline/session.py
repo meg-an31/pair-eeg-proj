@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -38,6 +38,7 @@ from .processing import (
     Processor,
 )
 from .quality import AcceptRate, QualityGate, QualityVerdict
+from .resting import RestingBaseline, RestingCollector, RestingStore
 from .rawlog import RawLog
 from .ringbuffer import RingBuffer
 
@@ -130,6 +131,7 @@ class Session:
         affect: AffectMapper | None = None,
         raw_log: RawLog | None = None,
         session_dir: Path | None = None,
+        resting_store: RestingStore | None = None,
     ):
         self.id = session_id
         self.wearer = wearer
@@ -142,6 +144,14 @@ class Session:
 
         self.state = SessionState.CONNECTING
         self.baseline = Baseline()
+
+        # Two minutes of staring at a wall. Restored from the last recording
+        # for this wearer so nobody has to sit still twice.
+        self.resting_store = resting_store
+        self.resting: RestingBaseline | None = (
+            resting_store.load(wearer) if resting_store else None
+        )
+        self._collector = RestingCollector(EEG, config.baseline_s)
         self.started_at = time.time()
         self._state_since = time.time()
         self._baseline_started: float | None = None
@@ -162,6 +172,12 @@ class Session:
         self._discontinuities = 0
         self._last_ingest: float | None = None
         self._tick_errors = 0
+
+        # Most recent result, held so a poller has something to read. Always
+        # overwritten, never queued: a slow reader should skip values, not
+        # fall progressively further behind a growing backlog.
+        self.latest: dict | None = None
+        self.latest_axes: dict | None = None
 
     # ------------------------------------------------------------------ io
 
@@ -195,6 +211,20 @@ class Session:
 
     # -------------------------------------------------------------- control
 
+    @property
+    def calibrated(self) -> bool:
+        """True only with a resting block to normalise against."""
+        return self.resting is not None
+
+    def use_saved_resting(self) -> bool:
+        """Skip the wall-staring block and reuse the stored one."""
+        if self.resting is None and self.resting_store is not None:
+            self.resting = self.resting_store.load(self.wearer)
+        if self.resting is not None:
+            self._transition(SessionState.LIVE)
+            return True
+        return False
+
     def begin_baseline(self) -> None:
         """Start the eyes-open rest block. Idempotent."""
         if self.state in (
@@ -204,6 +234,7 @@ class Session:
             SessionState.BASELINE,
         ):
             self.baseline = Baseline()
+            self._collector.reset()
             self._baseline_started = time.time()
             # Old smoother state was normalised against the previous
             # baseline; carrying it across would blend two calibrations.
@@ -329,15 +360,20 @@ class Session:
             imu=self._co_window(IMU, start, window_n),
         )
 
-        features = self.processor.process(epoch)
+        features = self.processor.process(epoch, resting=self.resting)
         features.check_shapes()
 
         if self.state is SessionState.BASELINE:
             self.baseline.observe(features.extras)
+            self._collector.observe(
+                start, eeg_window.samples, int(self.cfg.hop_s * EEG.rate_hz)
+            )
             await self.emit(self._baseline_payload(verdict, features))
             return
 
-        values = self.affect.map(features, calibrated=self.baseline.frozen)
+        values = self.affect.map(
+            features, calibrated=self.calibrated, resting=self.resting
+        )
         smoothed = self.smoother.update(values.axes)
         await self.emit(self._payload(verdict, features, values, smoothed))
 
@@ -370,6 +406,7 @@ class Session:
             elapsed = now - (self._baseline_started or now)
             if elapsed >= self.cfg.baseline_s:
                 self.baseline.freeze()
+                self._finish_resting()
                 self._persist_baseline()
                 self._transition(SessionState.LIVE)
             return
@@ -384,6 +421,28 @@ class Session:
                 self._degraded_since = None
                 self._transition(SessionState.LIVE)
 
+    def _finish_resting(self) -> None:
+        """Build the resting block and cache it for next time."""
+        built = self._collector.build(self.wearer)
+        if built is None:
+            log.warning(
+                "session %s: baseline block ended with no accepted epochs", self.id
+            )
+            return
+        built = replace(built, features=dict(self.baseline.mean))
+        self.resting = built
+        if self.resting_store is not None:
+            try:
+                path = self.resting_store.save(built)
+                log.info(
+                    "session %s: resting block saved (%.0fs) -> %s",
+                    self.id,
+                    built.duration_s,
+                    path,
+                )
+            except OSError:
+                log.exception("session %s: could not save resting block", self.id)
+
     def _persist_baseline(self) -> None:
         if self.session_dir is None:
             return
@@ -394,6 +453,24 @@ class Session:
         )
 
     # ------------------------------------------------------------- payloads
+
+    def _remember(self, payload: dict) -> dict:
+        """Hold the newest payload for polling. Overwrite, never queue."""
+        self.latest = payload
+        self.latest_axes = {
+            "type": "axes",
+            "session": self.id,
+            "seq": payload["seq"],
+            "t": payload["t"],
+            "state": payload["state"],
+            "axes": payload.get("axes"),
+            "confidence": payload.get("confidence"),
+            "calibrated": (payload.get("affect") or {}).get("calibrated", False),
+            "implemented": (payload.get("affect") or {}).get("implemented", False),
+            "accept_rate": (payload.get("quality") or {}).get("accept_rate"),
+            "accepted": (payload.get("quality") or {}).get("accepted"),
+        }
+        return payload
 
     def _envelope(self, verdict: QualityVerdict) -> dict:
         return {
@@ -429,11 +506,11 @@ class Session:
         }
 
     def _quality_only_payload(self, verdict: QualityVerdict) -> dict:
-        return {**self._envelope(verdict), **self._empty_fields()}
+        return self._remember({**self._envelope(verdict), **self._empty_fields()})
 
     def _baseline_payload(self, verdict: QualityVerdict, features: ProcessedFeatures) -> dict:
         elapsed = time.time() - (self._baseline_started or time.time())
-        return {
+        return self._remember({
             **self._envelope(verdict),
             **self._empty_fields(),
             "baseline": {
@@ -443,7 +520,7 @@ class Session:
                 "n": self.baseline.n,
             },
             **self._spectral(features),
-        }
+        })
 
     def _spectral(self, features: ProcessedFeatures) -> dict:
         return {
@@ -465,7 +542,7 @@ class Session:
         values: AffectValues,
         smoothed: dict[str, float],
     ) -> dict:
-        return {
+        return self._remember({
             **self._envelope(verdict),
             **self._empty_fields(),
             **self._spectral(features),
@@ -477,7 +554,7 @@ class Session:
                 "calibrated": values.calibrated,
                 "name": values.source,
             },
-        }
+        })
 
     def snapshot(self) -> dict:
         """Sent to a subscriber on connect so a reload costs nothing."""
@@ -491,7 +568,9 @@ class Session:
             "frames_in": self._frames_in,
             "discontinuities": self._discontinuities,
             "accept_rate": round(self.accept_rate.rate, 3),
-            "calibrated": self.baseline.frozen,
+            "calibrated": self.calibrated,
+            "resting": self.resting.summary() if self.resting else None,
+            "resting_available": self.resting is not None,
             "config": {
                 "window_s": self.cfg.window_s,
                 "hop_s": self.cfg.hop_s,

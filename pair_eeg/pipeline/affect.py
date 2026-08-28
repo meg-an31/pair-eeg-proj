@@ -9,9 +9,12 @@ has to know a band power from a z-score. The convention is:
     > 0.5 = above their baseline
     < 0.5 = below it
 
-which means these numbers are only meaningful once a baseline exists. Before
-that the session reports `calibrated: false` and the front end should treat
-the values as a liveness indicator, not a reading.
+which means these numbers are only meaningful once a resting block exists.
+Before that the session reports `calibrated: false` and the front end should
+treat the values as a liveness indicator, not a reading.
+
+The resting block — two minutes of staring at a wall — is passed in on every
+call. It is what 0.5 is defined against.
 
 Why several axes rather than one emotion word: valence and arousal alone
 cannot separate anger from fear — both are negative and high-arousal. What
@@ -27,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from .processing import ProcessedFeatures
+from .resting import RestingBaseline
 
 # The axes the front end animates. All values are 0-1.
 AXES: tuple[str, ...] = (
@@ -66,11 +70,23 @@ class AffectValues:
 
 @runtime_checkable
 class AffectMapper(Protocol):
-    """Processed features -> 0-1 axes."""
+    """Processed features -> 0-1 axes.
+
+    `resting` is the same wall-staring block the processor received. It is
+    passed here too because the mapping from a feature to a 0-1 position is
+    itself relative: 0.5 means the wearer's own resting level, and the spread
+    either side has to come from the distribution of that recording rather
+    than from a constant somebody picked.
+    """
 
     name: str
 
-    def map(self, features: ProcessedFeatures, calibrated: bool) -> AffectValues: ...
+    def map(
+        self,
+        features: ProcessedFeatures,
+        calibrated: bool,
+        resting: RestingBaseline | None = None,
+    ) -> AffectValues: ...
 
 
 class NullAffectMapper:
@@ -83,7 +99,12 @@ class NullAffectMapper:
 
     name = "null_v0"
 
-    def map(self, features: ProcessedFeatures, calibrated: bool) -> AffectValues:
+    def map(
+        self,
+        features: ProcessedFeatures,
+        calibrated: bool,
+        resting: RestingBaseline | None = None,
+    ) -> AffectValues:
         return AffectValues(
             axes={axis: NEUTRAL for axis in AXES},
             confidence={axis: 0.0 for axis in AXES},

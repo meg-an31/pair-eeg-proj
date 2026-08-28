@@ -7,6 +7,16 @@ is a null object that returns correctly shaped zeros.
 To fill it in, write a class satisfying `Processor` and hand it to the
 Session. Nothing else changes.
 
+Two inputs arrive on every call:
+
+  * `epoch`   — the newest window of samples (see `EpochWindow`)
+  * `resting` — two minutes of the wearer staring at a wall, raw, or None
+
+The resting block is the normalisation reference. Absolute band powers are
+close to meaningless across sessions — they shift with skull, hair, sweat and
+how the band sat that morning — so almost every useful number here is a ratio
+against, or a distance from, that recording.
+
 Target shapes, agreed with the front end:
 
     spectrum : (n_channels, 128) float32   0-127 Hz at 1 Hz spacing
@@ -40,6 +50,7 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from ..config import StreamSpec
+from .resting import RestingBaseline
 
 # Canonical band edges, half-open [lo, hi). Matches the existing repo.
 BANDS: dict[str, tuple[float, float]] = {
@@ -118,11 +129,23 @@ class ProcessedFeatures:
 
 @runtime_checkable
 class Processor(Protocol):
-    """Raw epoch -> spectra and band powers."""
+    """Raw epoch -> spectra and band powers.
+
+    `resting` is two minutes of the wearer staring at a wall, as raw samples.
+    It is None only when no resting block has been recorded or restored for
+    this wearer — a processor that needs it should say so rather than silently
+    returning uncalibrated numbers.
+
+    It is passed on every call rather than at construction because it can
+    arrive mid-session: a wearer may go live uncalibrated and record the
+    resting block afterwards.
+    """
 
     name: str
 
-    def process(self, epoch: EpochWindow) -> ProcessedFeatures: ...
+    def process(
+        self, epoch: EpochWindow, resting: RestingBaseline | None = None
+    ) -> ProcessedFeatures: ...
 
 
 class NullProcessor:
@@ -135,7 +158,9 @@ class NullProcessor:
 
     name = "null_v0"
 
-    def process(self, epoch: EpochWindow) -> ProcessedFeatures:
+    def process(
+        self, epoch: EpochWindow, resting: RestingBaseline | None = None
+    ) -> ProcessedFeatures:
         n_ch = epoch.n_channels
         return ProcessedFeatures(
             spectrum=np.zeros((n_ch, N_BINS), dtype=np.float32),
