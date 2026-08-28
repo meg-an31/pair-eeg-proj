@@ -168,7 +168,7 @@ def ppg_pulsatile(x, fs, harmonics=3):
     if k_hi <= k_lo:
         return None
 
-    best_k, best_score = None, -np.inf
+    scores = np.full(k_hi + 1, -np.inf)
     for k in range(k_lo, k_hi + 1):
         score, used = 0.0, 0
         for h in range(1, harmonics + 1):
@@ -177,11 +177,14 @@ def ppg_pulsatile(x, fs, harmonics=3):
                 break
             score += np.log(wht[kh] + 1e-30)
             used += 1
-        score /= used                      # mean, so fewer harmonics is not punished
-        if score > best_score:
-            best_score, best_k = score, k
+        scores[k] = score / used           # mean, so fewer harmonics is not punished
 
-    k = best_k
+    # Among candidates within a whisker of the best, take the LOWEST frequency:
+    # a near-tie between f and 2f is the classic octave error, and the
+    # fundamental is the physiological answer.
+    best_score = float(np.max(scores[k_lo:k_hi + 1]))
+    near = np.flatnonzero(scores[k_lo:k_hi + 1] >= best_score - 0.15) + k_lo
+    k = int(near[0])
     hz = k * df
     if 0 < k < wht.size - 1:               # parabolic refinement on the whitened peak
         a, b, c = (np.log(wht[k-1] + 1e-30), np.log(wht[k] + 1e-30),
@@ -215,13 +218,29 @@ def heart_rate(run_dir, meta):
     for name in ppg_channels(d):
         r = ppg_pulsatile(d[name], fs)
         if r:
-            scored.append((r[1], r[0], name))
+            scored.append({"bpm": 60.0 * r[0], "snr": r[1], "chan": name})
     if not scored:
         return None
-    snr, hz, chan = max(scored)
-    bpm = 60.0 * hz
+
+    # A movement artifact can dominate one channel; a real pulse shows up on
+    # more than one. So prefer the estimate the most channels agree on, and
+    # break ties by score.
+    best = None
+    for c in scored:
+        grp = [o for o in scored if abs(o["bpm"] - c["bpm"]) / c["bpm"] < 0.05]
+        w = sum(np.log(o["snr"] + 1) for o in grp)
+        cand = {
+            "bpm": sum(o["bpm"] * np.log(o["snr"] + 1) for o in grp) / w,
+            "snr": max(o["snr"] for o in grp),
+            "chan": max(grp, key=lambda o: o["snr"])["chan"],
+            "agree": len(grp), "weight": w,
+        }
+        if best is None or (cand["agree"], cand["weight"]) > (best["agree"], best["weight"]):
+            best = cand
+    snr, bpm, chan = best["snr"], best["bpm"], best["chan"]
 
     out = {"bpm_mean": round(bpm, 1), "channel": chan, "snr": round(snr, 1),
+           "channels_agreeing": best["agree"], "channels_total": len(scored),
            "fs": fs, "quality": "ok"}
 
     if snr < PPG_SNR_MIN:

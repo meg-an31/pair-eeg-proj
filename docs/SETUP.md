@@ -85,6 +85,14 @@ where the naive method read 47 bpm for a true 78. If you are on an older copy,
 update. And check it against your wrist: a fit person at rest genuinely can sit
 at 50.
 
+**A rate flipping rapidly between two very different values** (say 65 and 170)
+is not your heart. With a 32 s analysis window, consecutive estimates share
+almost all their data and cannot legitimately jump like that - what flips is
+which of the three PPG channels wins, when one is dominated by a movement
+artifact. The estimate is now the one the most channels agree on, smoothed over
+a 3 s median, and the readout says "unstable" with the spread rather than
+showing a number it cannot stand behind.
+
 If PPG streams but the rate looks wrong — a large `bpm_sd`, an implausible
 RMSSD, or far fewer beats than the rate implies — run
 `python python/ppg_check.py data/<run>` and look at `ppg_check.png`. A clear

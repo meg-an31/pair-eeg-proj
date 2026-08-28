@@ -174,7 +174,7 @@ const epoch = CH.map(() => 0);          // uint16 unwrap counter
 const last  = CH.map(() => -1);
 
 let device = null, chars = [], demoTimer = null, packets = 0, packetT0 = 0;
-let demoBpm = 66.0, demoDrift = false;   // test hooks, see the bottom of this file
+let demoBpm = 66.0, demoDrift = false, demoArtifact = 0;  // test hooks, see bottom
 let rec = null;                         // {rows, t0, markers, protocol, ...}
 let guided = null;                      // guided-protocol timer state
 
@@ -434,9 +434,16 @@ function startDemo(){
                     + 380 * Math.sin(2*Math.PI*0.55*t + 0.5)
                     + 260 * Math.sin(2*Math.PI*0.78*t + 1.3);
           }
+          /* demoArtifact puts a strong non-cardiac tone on PPG2 only, the way a
+             sensor rubbing against skin does - the case that made the readout
+             flip between the true rate and the artifact's. */
+          let art = 0;
+          if (demoArtifact && ch === 2)
+            art = 1400 * Math.sin(2*Math.PI*demoArtifact*t)
+                + 500 * Math.sin(4*Math.PI*demoArtifact*t + 0.4);
           vals.push(120000 + amp * (Math.sin(2*Math.PI*hz*t)
                     + 0.35 * Math.sin(4*Math.PI*hz*t + 0.9))
-                    + wander + (Math.random()-0.5) * amp * 0.35);
+                    + wander + art + (Math.random()-0.5) * amp * 0.35);
         }
         pushPpg(ch, pk, vals);
       }
@@ -459,6 +466,7 @@ function teardown(msg){
 function reset(){
   rows.clear(); nextRow = -1; maxSeen = -1; gaps = 0;
   held.fill(0); ringPos = 0; ringFilled = 0;
+  hrHist = [];
   pRows.clear(); pNext = -1; pMax = -1; pGaps = 0;
   pHeld.fill(0); pPos = 0; pFilled = 0;
   for (let c = 0; c < 3; c++){ pring[c].fill(0); pAbs[c] = -1; pEpoch[c] = 0; pLast[c] = -1; }
@@ -683,6 +691,50 @@ function whiten(psd, df, upto){
 
 /* A real pulse also puts energy at 2f and 3f; a drift shoulder does not. So
    candidates are scored across their harmonic series rather than by height. */
+function channelRate(ch, N, df, kLo, kHi){
+  const psd = ppgSpectrum(ch, N);
+  if (!psd) return null;
+  const HARM = 3;
+  const wht = whiten(psd, df, Math.min(psd.length - 1, kHi * HARM + 2));
+  const score = new Float64Array(kHi + 1);
+  let bs = -Infinity;
+  for (let k = kLo; k <= kHi; k++){
+    let sc = 0, used = 0;
+    for (let h = 1; h <= HARM; h++){
+      const kh = k * h;
+      if (kh >= wht.length) break;
+      sc += Math.log(wht[kh] + 1e-30); used++;
+    }
+    score[k] = sc / used;
+    if (score[k] > bs) bs = score[k];
+  }
+  /* Among candidates that score within a whisker of the best, take the LOWEST
+     frequency. A near-tie between f and 2f is the classic octave error, and the
+     fundamental is the physiological answer. */
+  let bk = kLo;
+  for (let k = kLo; k <= kHi; k++){
+    if (score[k] >= bs - 0.15){ bk = k; break; }
+  }
+  let hz = bk * df;
+  if (bk > 0 && bk < wht.length - 1){
+    const a = Math.log(wht[bk-1]+1e-30), b = Math.log(wht[bk]+1e-30),
+          c = Math.log(wht[bk+1]+1e-30), den = a - 2*b + c;
+    if (den !== 0) hz += 0.5 * (a - c) / den * df;
+  }
+  return { bpm: 60*hz, snr: wht[bk], ch };
+}
+
+/* Cross-channel agreement, then a temporal median.
+
+   A single channel can be dominated by a movement artifact, and with a 32 s
+   window two candidates can sit close enough in score that noise flips the
+   winner between frames - which showed up as the readout jumping between ~65
+   and ~170. A real pulse appears on more than one PPG channel, so the estimate
+   backed by the most channels wins, and the displayed value is the median of
+   the last few seconds rather than the latest frame. */
+const HR_HIST = 12;                     // 12 x 250 ms = 3 s
+let hrHist = [];
+
 function heartRate(){
   const N = ppgWindow();
   if (!N) return null;
@@ -690,33 +742,37 @@ function heartRate(){
   const kLo = Math.max(1, Math.ceil(HR_BAND[0]/df));
   const kHi = Math.floor(HR_BAND[1]/df);
   if (kHi <= kLo) return null;
-  const HARM = 3;
-  let best = null;
+
+  const per = [];
   for (let ch = 0; ch < 3; ch++){
-    const psd = ppgSpectrum(ch, N);
-    if (!psd) continue;
-    const wht = whiten(psd, df, Math.min(psd.length - 1, kHi * HARM + 2));
-    let bk = kLo, bs = -Infinity;
-    for (let k = kLo; k <= kHi; k++){
-      let score = 0, used = 0;
-      for (let h = 1; h <= HARM; h++){
-        const kh = k * h;
-        if (kh >= wht.length) break;
-        score += Math.log(wht[kh] + 1e-30); used++;
-      }
-      score /= used;
-      if (score > bs){ bs = score; bk = k; }
-    }
-    let hz = bk * df;
-    if (bk > 0 && bk < wht.length - 1){
-      const a = Math.log(wht[bk-1]+1e-30), b = Math.log(wht[bk]+1e-30),
-            c = Math.log(wht[bk+1]+1e-30), den = a - 2*b + c;
-      if (den !== 0) hz += 0.5 * (a - c) / den * df;
-    }
-    const snr = wht[bk];
-    if (!best || snr > best.snr) best = { bpm: 60*hz, snr, ch, secs: N / PFS };
+    const r = channelRate(ch, N, df, kLo, kHi);
+    if (r) per.push(r);
   }
-  return best;
+  if (!per.length) return null;
+
+  let best = null;
+  for (const c of per){
+    const grp = per.filter(o => Math.abs(o.bpm - c.bpm) / c.bpm < 0.05);
+    const weight = grp.reduce((a,o) => a + Math.log(o.snr + 1), 0);
+    const cand = {
+      bpm: grp.reduce((a,o) => a + o.bpm * Math.log(o.snr + 1), 0) / weight,
+      snr: Math.max.apply(null, grp.map(o => o.snr)),
+      agree: grp.length, weight,
+      ch: grp.reduce((a,o) => o.snr > a.snr ? o : a, grp[0]).ch,
+    };
+    if (!best || cand.agree > best.agree ||
+        (cand.agree === best.agree && cand.weight > best.weight)) best = cand;
+  }
+
+  hrHist.push(best.bpm);
+  if (hrHist.length > HR_HIST) hrHist.shift();
+  const sorted = hrHist.slice().sort((a,b) => a-b);
+  const med = sorted[sorted.length >> 1];
+  const spread = hrHist.length >= 4
+    ? (sorted[sorted.length-1] - sorted[0]) / med : 0;
+
+  return { bpm: med, snr: best.snr, ch: best.ch, agree: best.agree,
+           secs: N / PFS, spread, n: hrHist.length };
 }
 
 const BANDS = [["delta",1,4],["theta",4,8],["alpha",8,13],["beta",13,30],["gamma",30,45]];
@@ -818,12 +874,19 @@ function drawPulse(){
     $("bpm").className = "bpm bad";
     $("bpm").innerHTML = "--<small>no pulse found — seat the band flat on the "
       + "centre of the forehead and sit still</small>";
+  } else if (hr.spread > 0.15 && hr.n >= 6){
+    $("bpm").className = "bpm bad";
+    $("bpm").innerHTML = "~" + hr.bpm.toFixed(0)
+      + "<small>unstable (&plusmn;" + Math.round(hr.spread*100) + "% over 3 s) — "
+      + "the sensor is moving against the skin. Sit still and reseat the band."
+      + "</small>";
   } else {
     $("bpm").className = "bpm";
     $("bpm").innerHTML = hr.bpm.toFixed(1)
-      + "<small>bpm &middot; " + PCH[hr.ch] + " &middot; SNR " + hr.snr.toFixed(0)
+      + "<small>bpm &middot; " + PCH[hr.ch] + " &middot; "
+      + hr.agree + "/3 channels agree &middot; SNR " + hr.snr.toFixed(0)
       + (hr.snr < 50 ? " · rate only, too noisy for HRV" : " · clean")
-      + " · " + hr.secs + " s window</small>";
+      + "</small>";
   }
   $("pulseInfo").textContent = pFilled
     ? PCH.join(" / ") + " — " + Math.round(pFilled / PFS) + " s buffered at "
@@ -911,6 +974,7 @@ loop();
   if (!q.has("demo")) return;
   if (q.has("bpm")) demoBpm = parseFloat(q.get("bpm")) || 66.0;
   demoDrift = q.has("drift");
+  demoArtifact = q.has("artifact") ? (parseFloat(q.get("artifact")) || 2.83) : 0;
   startDemo();
   const secs = +q.get("rec") || 0;
   if (!secs) return;
@@ -935,8 +999,8 @@ loop();
       ppg_seconds: r && r.prows.length ? +(r.prows.length/PFS).toFixed(2) : 0,
       ppg_t_end: r && r.prows.length ? +r.prows[r.prows.length-1][0].toFixed(2) : null,
       hr: (() => { const h = heartRate();
-        return h ? {bpm: +h.bpm.toFixed(2), snr: Math.round(h.snr), chan: PCH[h.ch]}
-                 : null; })(),
+        return h ? {bpm: +h.bpm.toFixed(2), snr: Math.round(h.snr), chan: PCH[h.ch],
+                    agree: h.agree, spread: +h.spread.toFixed(3)} : null; })(),
       rms: [0,1,2,3].map(c => +rmsOf(c).toFixed(1)),
       alpha_frac: (() => { const ps = spectrum(0); if (!ps) return null;
         const tot = BANDS.reduce((a,[,lo,hi]) => a + bandPower(ps,lo,hi), 0);
