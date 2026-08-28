@@ -180,7 +180,7 @@ const last  = CH.map(() => -1);
 
 let device = null, chars = [], demoTimer = null, packets = 0, packetT0 = 0;
 let demoBpm = 66.0, demoDrift = false, demoArtifact = 0, demoHarm2 = false;
-let demoBrpm = 14.0, demoRed = false;
+let demoBrpm = 14.0, demoRed = false, demoBpm2 = 0, demoSwitchAt = 60;
 const demoRedState = [0, 0, 0];
 let rec = null;                         // {rows, t0, markers, protocol, ...}
 let guided = null;                      // guided-protocol timer state
@@ -430,7 +430,7 @@ function startDemo(){
         const vals = [];
         for (let i = 0; i < PSPP; i++){
           const t = (pk * PSPP + i) / PFS;
-          const hz = demoBpm / 60;
+          const hz = (demoBpm2 && t >= demoSwitchAt ? demoBpm2 : demoBpm) / 60;
           let amp = ch === 1 ? 900 : ch === 2 ? 700 : 140;
           const breath = demoBrpm > 0
             ? 0.55 * amp * Math.sin(2*Math.PI*(demoBrpm/60)*t + ch) : 0;
@@ -489,7 +489,7 @@ function teardown(msg){
 function reset(){
   rows.clear(); nextRow = -1; maxSeen = -1; gaps = 0;
   held.fill(0); ringPos = 0; ringFilled = 0;
-  hrHist = []; hrTrackBpm = null; brHist = [];
+  hrAcc = []; hrRejectRun = 0; brHist = [];
   pRows.clear(); pNext = -1; pMax = -1; pGaps = 0;
   pHeld.fill(0); pPos = 0; pFilled = 0;
   for (let c = 0; c < 3; c++){ pring[c].fill(0); pAbs[c] = -1; pEpoch[c] = 0; pLast[c] = -1; }
@@ -789,8 +789,29 @@ function channelRate(ch, N, df, kLo, kHi, track){
    and ~170. A real pulse appears on more than one PPG channel, so the estimate
    backed by the most channels wins, and the displayed value is the median of
    the last few seconds rather than the latest frame. */
-const HR_HIST = 20;                     // 20 x 250 ms = 5 s
-let hrHist = [], hrTrackBpm = null;
+/* Display pipeline: a one-minute trimmed running average. Each spectral
+   estimate (4/s) enters the 60 s window only if within 30% of the window's
+   current average - an octave flip is ~100% off and never gets in, so the
+   displayed value cannot jump. Escape hatch: ~15 s of CONSECUTIVE rejections
+   means the average itself is wrong (or the rate genuinely changed) - the
+   window clears and re-acquires rather than rejecting the truth forever. */
+const HR_WIN_MS = 60000, HR_REJECT_FRAC = 0.30, HR_STALE_FRAMES = 60;
+let hrAcc = [], hrRejectRun = 0;
+
+function hrUpdate(bpm, now){
+  while (hrAcc.length && now - hrAcc[0].t > HR_WIN_MS) hrAcc.shift();
+  const n = hrAcc.length;
+  const avg = n ? hrAcc.reduce((a,o) => a + o.bpm, 0) / n : null;
+  if (avg !== null && n >= 12 &&
+      Math.abs(bpm - avg) > Math.max(15, HR_REJECT_FRAC * avg)){
+    if (++hrRejectRun >= HR_STALE_FRAMES){ hrAcc = []; hrRejectRun = 0; }
+    return { avg, n, rejected: true };
+  }
+  hrRejectRun = 0;
+  hrAcc.push({ t: now, bpm });
+  return { avg: hrAcc.reduce((a,o) => a + o.bpm, 0) / hrAcc.length,
+           n: hrAcc.length, rejected: false };
+}
 
 /* Breathing: respiration modulates forehead blood volume, so the PPG baseline
    wander carries it directly at 0.08-0.66 Hz (5-40 breaths/min) - just below
@@ -895,7 +916,9 @@ function heartRate(){
 
   const per = [];
   for (let ch = 0; ch < 3; ch++){
-    const r = channelRate(ch, N, df, kLo, kHi, hrTrackBpm);
+    const track = hrAcc.length >= 12
+      ? hrAcc.reduce((a,o) => a + o.bpm, 0) / hrAcc.length : null;
+    const r = channelRate(ch, N, df, kLo, kHi, track);
     if (r) per.push(r);
   }
   if (!per.length) return null;
@@ -914,16 +937,13 @@ function heartRate(){
         (cand.agree === best.agree && cand.weight > best.weight)) best = cand;
   }
 
-  hrHist.push(best.bpm);
-  if (hrHist.length > HR_HIST) hrHist.shift();
-  const sorted = hrHist.slice().sort((a,b) => a-b);
-  const med = sorted[sorted.length >> 1];
-  const spread = hrHist.length >= 4
-    ? (sorted[sorted.length-1] - sorted[0]) / med : 0;
-
-  hrTrackBpm = spread > 0.15 ? null : med;   // drop the lock when unstable
-  return { bpm: med, snr: best.snr, ch: best.ch, agree: best.agree,
-           secs: N / PFS, spread, n: hrHist.length };
+  const now = performance.now();
+  const st = hrUpdate(best.bpm, now);
+  const spanS = hrAcc.length ? (now - hrAcc[0].t) / 1000 : 0;
+  return { bpm: st.avg, n: st.n, spanS: Math.round(spanS),
+           snr: best.snr, ch: best.ch, agree: best.agree,
+           rejected: st.rejected,
+           acquiring: st.n < 20 || spanS < 10 };
 }
 
 const BANDS = [["delta",1,4],["theta",4,8],["alpha",8,13],["beta",13,30],["gamma",30,45]];
@@ -1025,19 +1045,16 @@ function drawPulse(){
     $("bpm").className = "bpm bad";
     $("bpm").innerHTML = "--<small>no pulse found — seat the band flat on the "
       + "centre of the forehead and sit still</small>";
-  } else if (hr.spread > 0.15 && hr.n >= 6){
+  } else if (hr.acquiring || hr.bpm === null){
     $("bpm").className = "bpm bad";
-    $("bpm").innerHTML = "~" + hr.bpm.toFixed(0)
-      + "<small>unstable (&plusmn;" + Math.round(hr.spread*100) + "% over 3 s) — "
-      + "the sensor is moving against the skin. Sit still and reseat the band."
-      + "</small>";
+    $("bpm").innerHTML = (hr.bpm !== null ? "~" + hr.bpm.toFixed(0) : "--")
+      + "<small>acquiring — averaging begins after ~10 s of consistent pulse</small>";
   } else {
     $("bpm").className = "bpm";
     $("bpm").innerHTML = hr.bpm.toFixed(1)
-      + "<small>bpm &middot; " + PCH[hr.ch] + " &middot; "
-      + hr.agree + "/3 channels agree &middot; SNR " + hr.snr.toFixed(0)
-      + (hr.snr < 50 ? " · rate only, too noisy for HRV" : " · clean")
-      + "</small>";
+      + "<small>bpm &middot; " + Math.min(60, hr.spanS) + " s average &middot; "
+      + PCH[hr.ch] + " &middot; " + hr.agree + "/3 channels &middot; SNR "
+      + hr.snr.toFixed(0) + "</small>";
   }
   $("pulseInfo").textContent = pFilled
     ? PCH.join(" / ") + " — " + Math.round(pFilled / PFS) + " s buffered at "
@@ -1156,9 +1173,7 @@ loop();
   window.hrSeries = []; window.hrBlank = 0; window.brSeries = [];
   setInterval(() => { const h = heartRate();
     if (!h || h.n < 4) return;
-    if (h.snr < HR_SNR_MIN || (h.spread > 0.15 && h.n >= 6)){ window.hrBlank++;
-      (window.hrBlankLog = window.hrBlankLog || []).push(
-        {snr: +h.snr.toFixed(1), spread: +h.spread.toFixed(2), secs: h.secs}); }
+    if (h.snr < HR_SNR_MIN || h.acquiring || h.bpm === null) window.hrBlank++;
     else window.hrSeries.push(+h.bpm.toFixed(1));
     const b = breathRate();
     if (b && !b.ambiguous && b.n >= 8 && b.snr >= BR_SNR_MIN && b.spread <= 0.15)
@@ -1171,6 +1186,8 @@ loop();
     demoBrpm = isFinite(v) ? v : 14.0;
   }
   demoRed = q.has("rednoise");
+  demoBpm2 = parseFloat(q.get("bpm2")) || 0;
+  demoSwitchAt = parseFloat(q.get("switchat")) || 60;
   startDemo();
   const secs = +q.get("rec") || 0;
   if (!secs) return;
@@ -1201,8 +1218,9 @@ loop();
                 blank_frames: window.hrBlank || 0,
                 blank_log: (window.hrBlankLog || []).slice(0, 8)}; })(),
       hr: (() => { const h = heartRate();
-        return h ? {bpm: +h.bpm.toFixed(2), snr: Math.round(h.snr), chan: PCH[h.ch],
-                    agree: h.agree, spread: +h.spread.toFixed(3)} : null; })(),
+        return h ? {bpm: h.bpm === null ? null : +h.bpm.toFixed(2),
+                    snr: Math.round(h.snr), chan: PCH[h.ch], agree: h.agree,
+                    spanS: h.spanS, n: h.n} : null; })(),
       rms: [0,1,2,3].map(c => +rmsOf(c).toFixed(1)),
       alpha_frac: (() => { const ps = spectrum(0); if (!ps) return null;
         const tot = BANDS.reduce((a,[,lo,hi]) => a + bandPower(ps,lo,hi), 0);
