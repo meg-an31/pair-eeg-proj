@@ -1,0 +1,389 @@
+"""Session lifecycle and the epoch loop.
+
+    connecting -> fit_check -> baseline -> live
+                                   |         |
+                                   +--- degraded <--+
+
+Session state is part of the protocol, not just internal bookkeeping: nothing
+downstream is interpretable before a baseline exists, so the front end has to
+know which phase it is in to render honestly.
+
+`degraded` exists because losing 20-40% of epochs is the normal operating
+point for dry electrodes. A single rejected epoch is not a state change — it
+just produces no estimate that tick. Sustained rejection is, and the interface
+must be able to tell "calm" from "not currently measuring".
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+
+import numpy as np
+
+from ..config import EEG, IMU, PPG, THERM, Config
+from ..transport.protocol import DataFrame
+from .affect import AffectMapper, AffectValues, NullAffectMapper, Smoother
+from .processing import EpochWindow, ProcessedFeatures, NullProcessor, Processor
+from .quality import AcceptRate, QualityGate, QualityVerdict
+from .rawlog import RawLog
+from .ringbuffer import RingBuffer
+
+
+class SessionState(str, Enum):
+    CONNECTING = "connecting"
+    FIT_CHECK = "fit_check"
+    BASELINE = "baseline"
+    LIVE = "live"
+    DEGRADED = "degraded"
+    ENDED = "ended"
+
+
+@dataclass
+class Baseline:
+    """Running feature statistics, frozen at the end of the baseline phase.
+
+    Absolute band powers shift with skull, hair, sweat and how the band sat
+    that morning, so every downstream number is relative to this. Persisted
+    the moment it freezes — losing it to a restart costs the wearer another
+    two minutes of sitting still.
+    """
+
+    n: int = 0
+    _sum: dict[str, float] = field(default_factory=dict)
+    _sumsq: dict[str, float] = field(default_factory=dict)
+    frozen: bool = False
+    mean: dict[str, float] = field(default_factory=dict)
+    sd: dict[str, float] = field(default_factory=dict)
+
+    def observe(self, features: dict[str, float]) -> None:
+        if self.frozen:
+            return
+        for key, value in features.items():
+            self._sum[key] = self._sum.get(key, 0.0) + value
+            self._sumsq[key] = self._sumsq.get(key, 0.0) + value * value
+        self.n += 1
+
+    def freeze(self) -> None:
+        if self.frozen or self.n == 0:
+            return
+        for key, total in self._sum.items():
+            mean = total / self.n
+            var = max(self._sumsq[key] / self.n - mean * mean, 0.0)
+            self.mean[key] = mean
+            self.sd[key] = float(np.sqrt(var)) or 1.0
+        self.frozen = True
+
+    def to_dict(self) -> dict:
+        return {"n": self.n, "frozen": self.frozen, "mean": self.mean, "sd": self.sd}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Baseline":
+        b = cls(n=int(d.get("n", 0)), frozen=bool(d.get("frozen", False)))
+        b.mean = dict(d.get("mean", {}))
+        b.sd = dict(d.get("sd", {}))
+        return b
+
+
+# Emitted on every tick. The consumer decides what to draw.
+Emit = Callable[[dict], Awaitable[None]]
+
+
+class Session:
+    """One wearer, one recording, one pipeline instance.
+
+    Owns the ring buffers, the state machine and the epoch loop. Frames go in
+    via `ingest`; results come out via the `emit` callback.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        wearer: str,
+        config: Config,
+        emit: Emit,
+        processor: Processor | None = None,
+        affect: AffectMapper | None = None,
+        raw_log: RawLog | None = None,
+        session_dir: Path | None = None,
+    ):
+        self.id = session_id
+        self.wearer = wearer
+        self.cfg = config
+        self.emit = emit
+        self.processor: Processor = processor or NullProcessor()
+        self.affect: AffectMapper = affect or NullAffectMapper()
+        self.raw_log = raw_log
+        self.session_dir = session_dir
+
+        self.state = SessionState.CONNECTING
+        self.baseline = Baseline()
+        self.started_at = time.time()
+        self._state_since = time.time()
+        self._baseline_started: float | None = None
+
+        self.buffers = {
+            s.name: RingBuffer(s, int(s.rate_hz * config.buffer_s))
+            for s in (EEG, PPG, IMU, THERM)
+        }
+        self.gate = QualityGate(EEG.channels)
+        self.accept_rate = AcceptRate(config.accept_rate_window_s, config.hop_s)
+        self.smoother = Smoother(config.smoothing_alpha)
+
+        self._seq = 0
+        self._next_epoch_end: int | None = None
+        self._task: asyncio.Task | None = None
+        self._degraded_since: float | None = None
+        self._frames_in = 0
+        self._discontinuities = 0
+
+    # ------------------------------------------------------------------ io
+
+    def ingest(self, frame: DataFrame) -> None:
+        """Accept one data frame. Raw goes to disk before anything reads it."""
+        if self.raw_log is not None:
+            self.raw_log.submit(frame)
+
+        buf = self.buffers[frame.stream.name]
+        if not buf.empty and frame.counter > buf.head:
+            self._discontinuities += 1
+        buf.write(frame.counter, frame.samples)
+        self._frames_in += 1
+
+        if self.state is SessionState.CONNECTING:
+            self._transition(SessionState.FIT_CHECK)
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._loop(), name=f"session-{self.id}")
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        self._transition(SessionState.ENDED)
+
+    # -------------------------------------------------------------- control
+
+    def begin_baseline(self) -> None:
+        """Start the eyes-open rest block. Idempotent."""
+        if self.state in (SessionState.FIT_CHECK, SessionState.LIVE):
+            self.baseline = Baseline()
+            self._baseline_started = time.time()
+            self._transition(SessionState.BASELINE)
+
+    def skip_baseline(self) -> None:
+        """Go live uncalibrated. Values will be flagged `calibrated: false`."""
+        self._transition(SessionState.LIVE)
+
+    def _transition(self, state: SessionState) -> None:
+        if state is self.state:
+            return
+        self.state = state
+        self._state_since = time.time()
+
+    # ------------------------------------------------------------- the loop
+
+    async def _loop(self) -> None:
+        window_n = int(self.cfg.window_s * EEG.rate_hz)
+        hop_n = int(self.cfg.hop_s * EEG.rate_hz)
+        eeg = self.buffers[EEG.name]
+
+        while True:
+            await asyncio.sleep(self.cfg.hop_s)
+
+            if eeg.empty or eeg.available() < window_n:
+                continue
+
+            # Align the first epoch to whatever the device was at, then step
+            # by fixed hops so window boundaries stay on the sample grid.
+            if self._next_epoch_end is None:
+                self._next_epoch_end = eeg.head
+
+            while self._next_epoch_end <= eeg.head:
+                start = self._next_epoch_end - window_n
+                if start < eeg.tail:
+                    self._next_epoch_end = eeg.head
+                    break
+                await self._tick(start, window_n)
+                self._next_epoch_end += hop_n
+
+    async def _tick(self, start: int, window_n: int) -> None:
+        eeg_window = self.buffers[EEG.name].read(start, window_n)
+        verdict = self.gate.check(eeg_window)
+        self.accept_rate.record(verdict.accepted)
+        self._seq += 1
+
+        self._update_state(verdict)
+
+        if not verdict.accepted:
+            await self.emit(self._quality_only_payload(verdict))
+            return
+
+        epoch = EpochWindow(
+            t=time.time() - self.started_at,
+            counter=start,
+            fs=EEG.rate_hz,
+            channels=EEG.channels,
+            eeg=eeg_window.samples,
+            ppg=self._co_window(PPG, start, window_n),
+            imu=self._co_window(IMU, start, window_n),
+        )
+
+        features = self.processor.process(epoch)
+
+        if self.state is SessionState.BASELINE:
+            self.baseline.observe(features.extras)
+            await self.emit(self._baseline_payload(verdict, features))
+            return
+
+        values = self.affect.map(features, calibrated=self.baseline.frozen)
+        smoothed = self.smoother.update(values.axes)
+        await self.emit(self._payload(verdict, features, values, smoothed))
+
+    def _co_window(self, stream, eeg_start: int, eeg_n: int) -> np.ndarray | None:
+        """The same span of wall time on a stream with a different rate."""
+        buf = self.buffers[stream.name]
+        if buf.empty:
+            return None
+        ratio = stream.rate_hz / EEG.rate_hz
+        return buf.read(int(eeg_start * ratio), max(1, int(eeg_n * ratio))).samples
+
+    def _update_state(self, verdict: QualityVerdict) -> None:
+        now = time.time()
+        rate = self.accept_rate.rate
+
+        if self.state is SessionState.FIT_CHECK:
+            settled = now - self._state_since >= self.cfg.fit_check_settle_s
+            if settled and rate >= self.cfg.fit_check_min_accept:
+                self.begin_baseline()
+            return
+
+        if self.state is SessionState.BASELINE:
+            elapsed = now - (self._baseline_started or now)
+            if elapsed >= self.cfg.baseline_s:
+                self.baseline.freeze()
+                self._persist_baseline()
+                self._transition(SessionState.LIVE)
+            return
+
+        if self.state in (SessionState.LIVE, SessionState.DEGRADED):
+            poor = rate < self.cfg.degraded_below_accept and self.accept_rate.n > 3
+            if poor:
+                self._degraded_since = self._degraded_since or now
+                if now - self._degraded_since >= self.cfg.degraded_after_s:
+                    self._transition(SessionState.DEGRADED)
+            else:
+                self._degraded_since = None
+                self._transition(SessionState.LIVE)
+
+    def _persist_baseline(self) -> None:
+        if self.session_dir is None:
+            return
+        import json
+
+        (self.session_dir / "baseline.json").write_text(
+            json.dumps(self.baseline.to_dict(), indent=2)
+        )
+
+    # ------------------------------------------------------------- payloads
+
+    def _envelope(self, verdict: QualityVerdict) -> dict:
+        return {
+            "type": "estimate",
+            "session": self.id,
+            "seq": self._seq,
+            "t": round(time.time() - self.started_at, 3),
+            "state": self.state.value,
+            "quality": {
+                "accepted": verdict.accepted,
+                "channels": verdict.channels,
+                "accept_rate": round(self.accept_rate.rate, 3),
+                "fill": round(verdict.fill_ratio, 3),
+                "reason": verdict.reason,
+                "rms_uv": {k: round(v, 2) for k, v in verdict.rms_uv.items()},
+            },
+        }
+
+    def _quality_only_payload(self, verdict: QualityVerdict) -> dict:
+        return {**self._envelope(verdict), "axes": None, "spectrum": None, "bands": None}
+
+    def _baseline_payload(self, verdict: QualityVerdict, features: ProcessedFeatures) -> dict:
+        elapsed = time.time() - (self._baseline_started or time.time())
+        return {
+            **self._envelope(verdict),
+            "baseline": {
+                "elapsed_s": round(elapsed, 1),
+                "total_s": self.cfg.baseline_s,
+                "progress": round(min(elapsed / self.cfg.baseline_s, 1.0), 3),
+                "n": self.baseline.n,
+            },
+            **self._spectral(features),
+            "axes": None,
+        }
+
+    def _spectral(self, features: ProcessedFeatures) -> dict:
+        return {
+            "channels": list(features.channels),
+            "freqs_hz": {"n": len(features.freqs), "spacing": 1.0},
+            "spectrum": features.spectrum.round(4).tolist(),
+            "bands": features.bands.round(4).tolist(),
+            "band_names": list(features.band_names),
+            "processing": {
+                "implemented": features.implemented,
+                "name": getattr(self.processor, "name", "unknown"),
+            },
+        }
+
+    def _payload(
+        self,
+        verdict: QualityVerdict,
+        features: ProcessedFeatures,
+        values: AffectValues,
+        smoothed: dict[str, float],
+    ) -> dict:
+        return {
+            **self._envelope(verdict),
+            **self._spectral(features),
+            "axes": {k: round(v, 4) for k, v in smoothed.items()},
+            "axes_raw": {k: round(v, 4) for k, v in values.axes.items()},
+            "confidence": {k: round(v, 3) for k, v in values.confidence.items()},
+            "affect": {
+                "implemented": values.implemented,
+                "calibrated": values.calibrated,
+                "name": values.source,
+            },
+        }
+
+    def snapshot(self) -> dict:
+        """Sent to a subscriber on connect so a reload costs nothing."""
+        return {
+            "type": "snapshot",
+            "session": self.id,
+            "wearer": self.wearer,
+            "state": self.state.value,
+            "seq": self._seq,
+            "uptime_s": round(time.time() - self.started_at, 1),
+            "frames_in": self._frames_in,
+            "discontinuities": self._discontinuities,
+            "accept_rate": round(self.accept_rate.rate, 3),
+            "calibrated": self.baseline.frozen,
+            "config": {
+                "window_s": self.cfg.window_s,
+                "hop_s": self.cfg.hop_s,
+                "baseline_s": self.cfg.baseline_s,
+                "n_bins": 128,
+                "bin_hz": 1.0,
+            },
+            "stages": {
+                "processing": getattr(self.processor, "name", "unknown"),
+                "affect": getattr(self.affect, "name", "unknown"),
+            },
+        }

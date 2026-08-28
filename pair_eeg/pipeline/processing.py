@@ -1,0 +1,122 @@
+"""Signal processing seam.  ***NOT IMPLEMENTED — DELIBERATELY BLANK.***
+
+This is where raw samples become spectra and band powers. The interface is
+fixed so the rest of the system can be built and tested; the implementation
+is a null object that returns correctly shaped zeros.
+
+To fill it in, write a class satisfying `Processor` and hand it to the
+Session. Nothing else changes.
+
+Target shapes, agreed with the front end:
+
+    spectrum : (n_channels, 128) float32   0-127 Hz at 1 Hz spacing
+    bands    : (n_channels, 5)   float32   delta theta alpha beta gamma
+
+128 bins at 1 Hz follows from the hardware: the Muse samples at 256 Hz, so
+Nyquist is 128 Hz, and a 256-sample Welch segment gives 1 Hz spacing. Using
+Welch with nperseg=256 across a longer window keeps the 128 bins while
+averaging several segments, which cuts variance without changing resolution.
+
+Two things the real implementation must get right, both of which the existing
+offline pipeline does not:
+
+  * Filtering must be causal (`sosfilt` with retained state), not zero-phase
+    `filtfilt`, which needs the whole recording and cannot stream.
+  * Band integration must be defined once. The current repo has two
+    implementations that disagree (half-open trapezoid vs inclusive
+    rectangular sum) and two different relative-power denominators.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
+
+import numpy as np
+
+from ..config import StreamSpec
+
+# Canonical band edges, half-open [lo, hi). Matches the existing repo.
+BANDS: dict[str, tuple[float, float]] = {
+    "delta": (1.0, 4.0),
+    "theta": (4.0, 8.0),
+    "alpha": (8.0, 13.0),
+    "beta": (13.0, 30.0),
+    "gamma": (30.0, 45.0),
+}
+BAND_NAMES: tuple[str, ...] = tuple(BANDS)
+
+N_BINS = 128
+BIN_HZ = 1.0
+FREQS: np.ndarray = np.arange(N_BINS, dtype=np.float32) * BIN_HZ
+
+
+@dataclass(frozen=True)
+class EpochWindow:
+    """One epoch, post-quality-gate, handed to the processor.
+
+    `eeg` is (n_samples, n_channels) in microvolts, NaN where samples were
+    never received. `imu` and `ppg` are the co-timed windows where available.
+    """
+
+    t: float
+    counter: int
+    fs: float
+    channels: tuple[str, ...]
+    eeg: np.ndarray
+    ppg: np.ndarray | None = None
+    imu: np.ndarray | None = None
+
+    @property
+    def n_channels(self) -> int:
+        return len(self.channels)
+
+
+@dataclass(frozen=True)
+class ProcessedFeatures:
+    """Output of the processing stage.
+
+    `extras` carries whatever a real implementation wants to pass through to
+    the affect stage (FAA, corrugator envelope, blink rate, HRV, coherence)
+    without changing this dataclass every time.
+    """
+
+    spectrum: np.ndarray            # (n_channels, N_BINS)
+    bands: np.ndarray               # (n_channels, len(BAND_NAMES))
+    channels: tuple[str, ...]
+    freqs: np.ndarray = field(default_factory=lambda: FREQS)
+    band_names: tuple[str, ...] = BAND_NAMES
+    extras: dict[str, float] = field(default_factory=dict)
+    implemented: bool = True
+
+    def band(self, channel: str, band: str) -> float:
+        return float(self.bands[self.channels.index(channel), BAND_NAMES.index(band)])
+
+
+@runtime_checkable
+class Processor(Protocol):
+    """Raw epoch -> spectra and band powers."""
+
+    name: str
+
+    def process(self, epoch: EpochWindow) -> ProcessedFeatures: ...
+
+
+class NullProcessor:
+    """Placeholder. Returns correct shapes, all zeros, `implemented=False`.
+
+    Present so the transport, session lifecycle and payload can be exercised
+    end to end before any DSP exists. It does no filtering, no FFT and no
+    band integration — it is not a degraded processor, it is an absent one.
+    """
+
+    name = "null_v0"
+
+    def process(self, epoch: EpochWindow) -> ProcessedFeatures:
+        n_ch = epoch.n_channels
+        return ProcessedFeatures(
+            spectrum=np.zeros((n_ch, N_BINS), dtype=np.float32),
+            bands=np.zeros((n_ch, len(BAND_NAMES)), dtype=np.float32),
+            channels=epoch.channels,
+            implemented=False,
+        )
