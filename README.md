@@ -106,6 +106,18 @@ beat count matches the rate, and it self-flags when it lands near the 15.6 ms
 floor imposed by the 64 Hz sample rate. Treat the rate as solid and HRV as
 indicative.
 
+## Breathing
+
+Respiration modulates forehead blood volume, so the PPG baseline wander carries
+it directly at 0.08-0.66 Hz (5-40 breaths/min), just below the cardiac band.
+The page shows it live under the heart rate: it needs 32 s of data for a first
+reading and sharpens to a 64 s window (~1 breath/min resolution). The
+background for peak scoring is an annulus around each bin rather than a rolling
+median, so two slow rhythms close together do not mask each other - and when a
+second rhythm of comparable strength shares the band (postural sway does this),
+the readout says "several slow rhythms present" rather than guessing which one
+is breathing.
+
 ## No headband yet?
 
 ```bash
@@ -124,7 +136,7 @@ before trusting any real recording.
 
 | Path | What |
 |---|---|
-| `web/index.html` | Self-contained Web Bluetooth client — live EEG scope, per-channel quality, band powers, live heart rate from PPG, guided protocol, CSV export. No dependencies. |
+| `web/index.html` | Self-contained Web Bluetooth client — live EEG scope, per-channel quality, band powers, live heart rate and breathing rate from PPG, guided protocol, CSV export. No dependencies. |
 | `python/capture.py` | BrainFlow capture: EEG + PPG + IMU, guided or continuous protocols, signal-quality check. |
 | `python/analyze.py` | Shared analysis pipeline. Consumes either path's output. |
 | `python/ppg_check.py` | PPG diagnostic: per-channel quality table plus a figure of the pulse waveform with detected beats. Run it when the heart rate is missing or implausible. |

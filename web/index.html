@@ -56,6 +56,10 @@
        font-variant-numeric:tabular-nums;line-height:1.1}
   .bpm small{display:block;font-size:13px;font-weight:400;color:var(--dim)}
   .bpm.bad{color:var(--dim)}
+  .breath{font-size:19px;font-weight:600;text-align:center;padding:8px 0 2px;
+          font-variant-numeric:tabular-nums}
+  .breath small{display:block;font-size:12px;font-weight:400;color:var(--dim)}
+  .breath.bad{color:var(--dim)}
   code{background:#0b0e13;padding:1px 5px;border-radius:4px;font-size:12px}
 </style>
 </head>
@@ -102,9 +106,10 @@
     </div>
 
     <div class="card">
-      <h2>Heart rate — PPG pulse</h2>
+      <h2>Heart &amp; breathing — PPG</h2>
       <div class="bpm" id="bpm">--<small>waiting for 32 s of pulse data</small></div>
       <canvas id="pulse" height="130"></canvas>
+      <div class="breath" id="breath">breathing --<small>needs 32 s of data</small></div>
       <div class="legend" id="pulseInfo"></div>
     </div>
   </div>
@@ -175,6 +180,7 @@ const last  = CH.map(() => -1);
 
 let device = null, chars = [], demoTimer = null, packets = 0, packetT0 = 0;
 let demoBpm = 66.0, demoDrift = false, demoArtifact = 0, demoHarm2 = false;
+let demoBrpm = 14.0;
 let rec = null;                         // {rows, t0, markers, protocol, ...}
 let guided = null;                      // guided-protocol timer state
 
@@ -252,7 +258,7 @@ function recordRow(n, row){
    keyed by absolute sample number. Samples are 24-bit unsigned, six per
    notification, and are left in raw sensor units - only their variation
    matters for a pulse. */
-const PRING = PFS * 40;                 // 40 s: enough for a 32 s spectrum
+const PRING = PFS * 96;                 // 96 s: 32 s cardiac + 64 s respiratory windows
 const pring = PCH.map(() => new Float32Array(PRING));
 let pPos = 0, pFilled = 0;
 const pRows = new Map(), pHeld = new Float32Array(3);
@@ -425,13 +431,14 @@ function startDemo(){
           const t = (pk * PSPP + i) / PFS;
           const hz = demoBpm / 60;
           let amp = ch === 1 ? 900 : ch === 2 ? 700 : 140;
+          const breath = 0.55 * amp * Math.sin(2*Math.PI*(demoBrpm/60)*t + ch);
           let wander = 300 * Math.sin(2*Math.PI*0.05*t);
           if (demoDrift){                        // loose sensor: buried pulse
             amp *= 0.10;
             wander += 900 * Math.sin(2*Math.PI*0.09*t)
                     + 700 * Math.sin(2*Math.PI*0.16*t + 1)
                     + 500 * Math.sin(2*Math.PI*0.28*t + 2)
-                    + 380 * Math.sin(2*Math.PI*0.55*t + 0.5)
+                    + 380 * Math.sin(2*Math.PI*0.72*t + 0.5)
                     + 260 * Math.sin(2*Math.PI*0.78*t + 1.3);
           }
           /* demoArtifact puts a strong non-cardiac tone on PPG2 only, the way a
@@ -452,7 +459,7 @@ function startDemo(){
           } else {
             wave = Math.sin(2*Math.PI*hz*t) + 0.35 * Math.sin(4*Math.PI*hz*t + 0.9);
           }
-          vals.push(120000 + amp * wave
+          vals.push(120000 + amp * wave + breath
                     + wander + art + (Math.random()-0.5) * amp * 0.35);
         }
         pushPpg(ch, pk, vals);
@@ -476,7 +483,7 @@ function teardown(msg){
 function reset(){
   rows.clear(); nextRow = -1; maxSeen = -1; gaps = 0;
   held.fill(0); ringPos = 0; ringFilled = 0;
-  hrHist = []; hrTrackBpm = null;
+  hrHist = []; hrTrackBpm = null; brHist = [];
   pRows.clear(); pNext = -1; pMax = -1; pGaps = 0;
   pHeld.fill(0); pPos = 0; pFilled = 0;
   for (let c = 0; c < 3; c++){ pring[c].fill(0); pAbs[c] = -1; pEpoch[c] = 0; pLast[c] = -1; }
@@ -684,8 +691,8 @@ function ppgSpectrum(ch, N){
    largest raw bin in a band starting at 0.7 Hz sits at the low edge whatever
    the pulse is doing - that reported ~47 bpm for a true 78. Dividing by the
    local median scores how far a bin stands above its neighbourhood instead. */
-function whiten(psd, df, upto){
-  const w = Math.max(3, (Math.round(0.5 / df) | 1));   // ~0.5 Hz, odd
+function whiten(psd, df, upto, hwHz){
+  const w = Math.max(3, (Math.round((hwHz || 0.5) / df) | 1));   // odd width
   const half = w >> 1, out = new Float64Array(upto + 1), buf = new Float64Array(w);
   for (let k = 0; k <= upto; k++){
     let m = 0;
@@ -732,12 +739,19 @@ function channelRate(ch, N, df, kLo, kHi, track){
   }
   /* Octave guard: if half this frequency also carries a real whitened peak,
      the candidate is the 2nd harmonic of a slower pulse - take the fundamental.
-     A genuinely fast pulse has only noise (wht ~ 1) at half its rate. */
-  const k2 = Math.round(bk / 2);
-  if (k2 - 1 >= kLo){
-    let j = k2 - 1;
-    for (let i = k2; i <= k2 + 1; i++) if (wht[i] > wht[j]) j = i;
-    if (wht[j] >= 3) bk = j;
+     Calibrated on noise statistics: the whitened half-rate bin reaches ~8.5 on
+     pure noise at a full 32 s window and ~26 at shorter ones, while real weak
+     fundamentals sit above ~9. So the guard needs the full window and a
+     threshold of 9 - the first version used 3 at any window length and halved
+     genuine fast pulses on noise spikes, which the instability gate then
+     (correctly) refused to display. */
+  if (N >= PNFFT){
+    const k2 = Math.round(bk / 2);
+    if (k2 - 1 >= kLo){
+      let j = k2 - 1;
+      for (let i = k2; i <= k2 + 1; i++) if (wht[i] > wht[j]) j = i;
+      if (wht[j] >= 9) bk = j;
+    }
   }
   let hz = bk * df;
   if (bk > 0 && bk < wht.length - 1){
@@ -745,7 +759,16 @@ function channelRate(ch, N, df, kLo, kHi, track){
           c = Math.log(wht[bk+1]+1e-30), den = a - 2*b + c;
     if (den !== 0) hz += 0.5 * (a - c) / den * df;
   }
-  return { bpm: 60*hz, snr: wht[bk], ch };
+  /* Quality = evidence for the pulse across its harmonics, not the fundamental
+     bin alone: when perfusion dips the fundamental can be nearly absent while
+     2f/3f still carry the pulse - judging by the empty bin blanks the readout. */
+  let ev = wht[bk];
+  for (let h = 2; h <= 3; h++){
+    const kh = bk * h;
+    for (let i = kh - 1; i <= kh + 1; i++)
+      if (i < wht.length && wht[i] > ev) ev = wht[i];
+  }
+  return { bpm: 60*hz, snr: ev, ch };
 }
 
 /* Cross-channel agreement, then a temporal median.
@@ -758,6 +781,83 @@ function channelRate(ch, N, df, kLo, kHi, track){
    the last few seconds rather than the latest frame. */
 const HR_HIST = 12;                     // 12 x 250 ms = 3 s
 let hrHist = [], hrTrackBpm = null;
+
+/* Breathing: respiration modulates forehead blood volume, so the PPG baseline
+   wander carries it directly at 0.08-0.66 Hz (5-40 breaths/min) - just below
+   the cardiac band. Same estimator, different band and a narrower whitening
+   width, plus a longer window: 64 s gives ~0.9 brpm bin resolution. */
+const BR_BAND = [0.08, 0.66], BR_SNR_MIN = 6, BR_NFFT = 4096, BR_MIN_FFT = 2048;
+let brHist = [];
+
+/* Background for the breathing band: the 25th percentile of an annulus around
+   each bin (3-12 bins away, both sides). A plain rolling median masks closely
+   spaced rhythms against each other - the window covers the neighbour's peak,
+   inflates the background, and whichever line has the emptiest neighbourhood
+   wins regardless of which one is breathing. The annulus excludes the bin's
+   own spectral lobe, and the low quantile shrugs off one contaminating
+   neighbour line inside the ring. */
+function breathWhiten(psd, kLo, kHi){
+  const out = new Float64Array(kHi + 1), ring = [];
+  for (let k = kLo; k <= kHi; k++){
+    ring.length = 0;
+    for (const sgn of [-1, 1])
+      for (let d = 3; d <= 12; d++){
+        const i = k + sgn * d;
+        if (i >= 1 && i < psd.length) ring.push(psd[i]);
+      }
+    ring.sort((a,b) => a - b);
+    const base = ring[Math.floor(ring.length * 0.25)] || 1e-30;
+    out[k] = psd[k] / Math.max(base, 1e-30);
+  }
+  return out;
+}
+
+function breathRate(){
+  let N = BR_NFFT;
+  while (N > BR_MIN_FFT && N > pFilled) N >>= 1;
+  if (N > pFilled) return null;
+  const df = PFS / N;
+  const kLo = Math.max(1, Math.ceil(BR_BAND[0]/df));
+  const kHi = Math.floor(BR_BAND[1]/df);
+  if (kHi <= kLo) return null;
+  let best = null;
+  for (let ch = 0; ch < 3; ch++){
+    const psd = ppgSpectrum(ch, N);
+    if (!psd) continue;
+    const wht = breathWhiten(psd, kLo, kHi);
+    let bk = kLo;
+    for (let k = kLo; k <= kHi; k++) if (wht[k] > wht[bk]) bk = k;
+    /* Ambiguity check: postural sway and vasomotor waves put their own lines in
+       this band, and a second peak of comparable height means "which one is
+       breathing?" cannot be answered from the spectrum - say so rather than
+       guess. Peaks closer than 0.08 Hz are the same rhythm. */
+    let second = 0;
+    for (let k = kLo; k <= kHi; k++){
+      const far = Math.abs(k - bk) * df > 0.08          // not the same rhythm
+        && Math.abs(k - 2*bk) * df > 0.08;              // not its 2nd harmonic
+      if (far && wht[k] > second) second = wht[k];
+    }
+    const ambiguous = second >= Math.max(BR_SNR_MIN, 0.25 * wht[bk]);
+    let hz = bk * df;
+    if (bk > 0 && bk < wht.length - 1){
+      const a = Math.log(wht[bk-1]+1e-30), b = Math.log(wht[bk]+1e-30),
+            c = Math.log(wht[bk+1]+1e-30), den = a - 2*b + c;
+      if (den !== 0) hz += 0.5 * (a - c) / den * df;
+    }
+    if (!best || wht[bk] > best.snr)
+      best = { brpm: 60*hz, snr: wht[bk], ch, secs: N/PFS, ambiguous };
+  }
+  if (!best) return null;
+  if (best.ambiguous) return { ambiguous: true, snr: best.snr, ch: best.ch,
+                               secs: best.secs, n: brHist.length };
+  brHist.push(best.brpm);
+  if (brHist.length > HR_HIST) brHist.shift();
+  const sorted = brHist.slice().sort((a,b) => a-b);
+  const med = sorted[sorted.length >> 1];
+  const spread = brHist.length >= 4 ? (sorted[sorted.length-1]-sorted[0])/med : 0;
+  return { brpm: med, snr: best.snr, ch: best.ch, secs: best.secs,
+           spread, n: brHist.length };
+}
 
 function heartRate(){
   const N = ppgWindow();
@@ -942,6 +1042,32 @@ function drawPulse(){
   g.fillText(PCH[ch] + "  6 s", 6, 14);
 }
 
+function drawBreath(){
+  const el = $("breath");
+  const br = breathRate();
+  if (!br){
+    el.className = "breath bad";
+    el.innerHTML = "breathing --<small>needs " +
+      Math.max(1, Math.ceil((BR_MIN_FFT - pFilled) / PFS)) + " s more data</small>";
+  } else if (br.ambiguous){
+    el.className = "breath bad";
+    el.innerHTML = "breathing --<small>several slow rhythms present — sit still, "
+      + "breathe evenly</small>";
+  } else if (br.snr < BR_SNR_MIN){
+    el.className = "breath bad";
+    el.innerHTML = "breathing --<small>no respiratory rhythm above the noise</small>";
+  } else if (br.spread > 0.25 && br.n >= 6){
+    el.className = "breath bad";
+    el.innerHTML = "breathing ~" + br.brpm.toFixed(0)
+      + "<small>unstable — breathe evenly for a moment</small>";
+  } else {
+    el.className = "breath";
+    el.innerHTML = "breathing " + br.brpm.toFixed(1)
+      + " /min<small>" + PCH[br.ch] + " · SNR " + br.snr.toFixed(0)
+      + " · " + br.secs + " s window</small>";
+  }
+}
+
 function drawTable(){
   const lineHz = +$("linehz").value || 50;
   const html = CH.map((name, c) => {
@@ -972,7 +1098,7 @@ function loop(){
   drawScope();
   requestAnimationFrame(loop);
 }
-setInterval(() => { drawBands(); drawTable(); drawPulse(); }, 250);
+setInterval(() => { drawBands(); drawTable(); drawPulse(); drawBreath(); }, 250);
 
 /* -------------------------------------------------------------------- wire -- */
 $("btnConnect").onclick    = () => { reset(); connect(); };
@@ -998,12 +1124,20 @@ loop();
   const q = new URLSearchParams(location.search);
   if (!q.has("demo")) return;
   if (q.has("bpm")) demoBpm = parseFloat(q.get("bpm")) || 66.0;
-  window.hrSeries = [];
+  window.hrSeries = []; window.hrBlank = 0; window.brSeries = [];
   setInterval(() => { const h = heartRate();
-    if (h && h.n >= 4) window.hrSeries.push(+h.bpm.toFixed(1)); }, 1000);
+    if (!h || h.n < 4) return;
+    if (h.snr < HR_SNR_MIN || (h.spread > 0.15 && h.n >= 6)){ window.hrBlank++;
+      (window.hrBlankLog = window.hrBlankLog || []).push(
+        {snr: +h.snr.toFixed(1), spread: +h.spread.toFixed(2), secs: h.secs}); }
+    else window.hrSeries.push(+h.bpm.toFixed(1));
+    const b = breathRate();
+    if (b && !b.ambiguous && b.n >= 4 && b.snr >= BR_SNR_MIN && b.spread <= 0.25)
+      window.brSeries.push(+b.brpm.toFixed(1)); }, 1000);
   demoDrift = q.has("drift");
   demoArtifact = q.has("artifact") ? (parseFloat(q.get("artifact")) || 2.83) : 0;
   demoHarm2 = q.has("harm2");
+  if (q.has("brpm")) demoBrpm = parseFloat(q.get("brpm")) || 14.0;
   startDemo();
   const secs = +q.get("rec") || 0;
   if (!secs) return;
@@ -1027,9 +1161,12 @@ loop();
       ppg_first: r ? (ppgCsvOf(r).split("\n")[1] || "") : "",
       ppg_seconds: r && r.prows.length ? +(r.prows.length/PFS).toFixed(2) : 0,
       ppg_t_end: r && r.prows.length ? +r.prows[r.prows.length-1][0].toFixed(2) : null,
+      br_series: (() => { const a = window.brSeries || []; if (!a.length) return null;
+        return {n: a.length, min: Math.min.apply(null,a), max: Math.max.apply(null,a)}; })(),
       hr_series: (() => { const a = window.hrSeries || []; if (!a.length) return null;
         return {n: a.length, min: Math.min.apply(null,a), max: Math.max.apply(null,a),
-                first: a[0], last: a[a.length-1]}; })(),
+                blank_frames: window.hrBlank || 0,
+                blank_log: (window.hrBlankLog || []).slice(0, 8)}; })(),
       hr: (() => { const h = heartRate();
         return h ? {bpm: +h.bpm.toFixed(2), snr: Math.round(h.snr), chan: PCH[h.ch],
                     agree: h.agree, spread: +h.spread.toFixed(3)} : null; })(),
