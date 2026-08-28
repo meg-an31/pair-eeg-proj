@@ -180,7 +180,8 @@ const last  = CH.map(() => -1);
 
 let device = null, chars = [], demoTimer = null, packets = 0, packetT0 = 0;
 let demoBpm = 66.0, demoDrift = false, demoArtifact = 0, demoHarm2 = false;
-let demoBrpm = 14.0;
+let demoBrpm = 14.0, demoRed = false;
+const demoRedState = [0, 0, 0];
 let rec = null;                         // {rows, t0, markers, protocol, ...}
 let guided = null;                      // guided-protocol timer state
 
@@ -431,8 +432,13 @@ function startDemo(){
           const t = (pk * PSPP + i) / PFS;
           const hz = demoBpm / 60;
           let amp = ch === 1 ? 900 : ch === 2 ? 700 : 140;
-          const breath = 0.55 * amp * Math.sin(2*Math.PI*(demoBrpm/60)*t + ch);
+          const breath = demoBrpm > 0
+            ? 0.55 * amp * Math.sin(2*Math.PI*(demoBrpm/60)*t + ch) : 0;
           let wander = 300 * Math.sin(2*Math.PI*0.05*t);
+          if (demoRed){        // AR(1) random walk: realistic vasomotor/sway drift
+            demoRedState[ch] = 0.995 * demoRedState[ch] + (Math.random()-0.5) * 208;
+            wander += demoRedState[ch];
+          }
           if (demoDrift){                        // loose sensor: buried pulse
             amp *= 0.10;
             wander += 900 * Math.sin(2*Math.PI*0.09*t)
@@ -751,6 +757,10 @@ function channelRate(ch, N, df, kLo, kHi, track){
       let j = k2 - 1;
       for (let i = k2; i <= k2 + 1; i++) if (wht[i] > wht[j]) j = i;
       if (wht[j] >= 9) bk = j;
+      /* NOTE: do not lower this threshold when the track agrees with the
+         halved rate - tried and reverted. A strong non-cardiac line can seed
+         the track, and track-corroborated halving then locks the readout onto
+         half the true rate through its own feedback. */
     }
   }
   let hz = bk * df;
@@ -779,14 +789,14 @@ function channelRate(ch, N, df, kLo, kHi, track){
    and ~170. A real pulse appears on more than one PPG channel, so the estimate
    backed by the most channels wins, and the displayed value is the median of
    the last few seconds rather than the latest frame. */
-const HR_HIST = 12;                     // 12 x 250 ms = 3 s
+const HR_HIST = 20;                     // 20 x 250 ms = 5 s
 let hrHist = [], hrTrackBpm = null;
 
 /* Breathing: respiration modulates forehead blood volume, so the PPG baseline
    wander carries it directly at 0.08-0.66 Hz (5-40 breaths/min) - just below
    the cardiac band. Same estimator, different band and a narrower whitening
    width, plus a longer window: 64 s gives ~0.9 brpm bin resolution. */
-const BR_BAND = [0.08, 0.66], BR_SNR_MIN = 6, BR_NFFT = 4096, BR_MIN_FFT = 2048;
+const BR_BAND = [0.08, 0.66], BR_SNR_MIN = 12, BR_NFFT = 4096, BR_MIN_FFT = 2048;
 let brHist = [];
 
 /* Background for the breathing band: the 25th percentile of an annulus around
@@ -797,16 +807,24 @@ let brHist = [];
    own spectral lobe, and the low quantile shrugs off one contaminating
    neighbour line inside the ring. */
 function breathWhiten(psd, kLo, kHi){
-  const out = new Float64Array(kHi + 1), ring = [];
+  /* Background = geometric mean of the two sides' medians. A single quantile
+     over the whole ring fails on a 1/f slope: the high side of the band edge
+     is always quieter, the low quantile measures the quiet side, and the
+     entire drift shoulder whitens into a fake peak pinned near the band floor
+     (verified: false peaks up to ~18 on pure red noise, reading "8 breaths/min"
+     regardless of actual breathing). Per-side medians interpolate the slope at
+     k instead: pure red noise stays under ~6, real breathing scores ~30. */
+  const out = new Float64Array(kHi + 1), L = [], R = [];
   for (let k = kLo; k <= kHi; k++){
-    ring.length = 0;
-    for (const sgn of [-1, 1])
-      for (let d = 3; d <= 12; d++){
-        const i = k + sgn * d;
-        if (i >= 1 && i < psd.length) ring.push(psd[i]);
-      }
-    ring.sort((a,b) => a - b);
-    const base = ring[Math.floor(ring.length * 0.25)] || 1e-30;
+    L.length = 0; R.length = 0;
+    for (let d = 3; d <= 12; d++){
+      if (k - d >= 1) L.push(psd[k - d]);
+      if (k + d < psd.length) R.push(psd[k + d]);
+    }
+    L.sort((a,b) => a-b); R.sort((a,b) => a-b);
+    const l = L.length >= 2 ? L[L.length >> 1] : 0;
+    const r = R.length >= 2 ? R[R.length >> 1] : 0;
+    const base = (l && r) ? Math.sqrt(l * r) : (l || r || 1e-30);
     out[k] = psd[k] / Math.max(base, 1e-30);
   }
   return out;
@@ -825,8 +843,16 @@ function breathRate(){
     const psd = ppgSpectrum(ch, N);
     if (!psd) continue;
     const wht = breathWhiten(psd, kLo, kHi);
-    let bk = kLo;
-    for (let k = kLo; k <= kHi; k++) if (wht[k] > wht[bk]) bk = k;
+    /* A genuine rhythm is a local maximum of the raw spectrum. The edge of the
+       broadband drift hump can whiten tall at the band floor while the raw
+       spectrum is still monotonically falling through it - that is a slope,
+       not a breath, and it read as a constant ~7/min on red noise. */
+    let bk = -1;
+    for (let k = kLo; k <= kHi; k++){
+      if (psd[k] > psd[k-1] && psd[k] > psd[k+1] && (bk < 0 || wht[k] > wht[bk]))
+        bk = k;
+    }
+    if (bk < 0) continue;
     /* Ambiguity check: postural sway and vasomotor waves put their own lines in
        this band, and a second peak of comparable height means "which one is
        breathing?" cannot be answered from the spectrum - say so rather than
@@ -1049,6 +1075,9 @@ function drawBreath(){
     el.className = "breath bad";
     el.innerHTML = "breathing --<small>needs " +
       Math.max(1, Math.ceil((BR_MIN_FFT - pFilled) / PFS)) + " s more data</small>";
+  } else if (br.n < 8){
+    el.className = "breath bad";
+    el.innerHTML = "breathing --<small>settling…</small>";
   } else if (br.ambiguous){
     el.className = "breath bad";
     el.innerHTML = "breathing --<small>several slow rhythms present — sit still, "
@@ -1056,7 +1085,7 @@ function drawBreath(){
   } else if (br.snr < BR_SNR_MIN){
     el.className = "breath bad";
     el.innerHTML = "breathing --<small>no respiratory rhythm above the noise</small>";
-  } else if (br.spread > 0.25 && br.n >= 6){
+  } else if (br.spread > 0.15 && br.n >= 6){
     el.className = "breath bad";
     el.innerHTML = "breathing ~" + br.brpm.toFixed(0)
       + "<small>unstable — breathe evenly for a moment</small>";
@@ -1132,12 +1161,16 @@ loop();
         {snr: +h.snr.toFixed(1), spread: +h.spread.toFixed(2), secs: h.secs}); }
     else window.hrSeries.push(+h.bpm.toFixed(1));
     const b = breathRate();
-    if (b && !b.ambiguous && b.n >= 4 && b.snr >= BR_SNR_MIN && b.spread <= 0.25)
+    if (b && !b.ambiguous && b.n >= 8 && b.snr >= BR_SNR_MIN && b.spread <= 0.15)
       window.brSeries.push(+b.brpm.toFixed(1)); }, 1000);
   demoDrift = q.has("drift");
   demoArtifact = q.has("artifact") ? (parseFloat(q.get("artifact")) || 2.83) : 0;
   demoHarm2 = q.has("harm2");
-  if (q.has("brpm")) demoBrpm = parseFloat(q.get("brpm")) || 14.0;
+  if (q.has("brpm")){
+    const v = parseFloat(q.get("brpm"));
+    demoBrpm = isFinite(v) ? v : 14.0;
+  }
+  demoRed = q.has("rednoise");
   startDemo();
   const secs = +q.get("rec") || 0;
   if (!secs) return;
